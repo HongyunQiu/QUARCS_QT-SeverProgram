@@ -1,4 +1,4 @@
-# WebSocket Commands in MainWindow::onMessageReceived
+WebSocket Commands in MainWindow::onMessageReceived
 
 | Command                          | Action Description                                                                                    |
 |----------------------------------|-------------------------------------------------------------------------------------------------------|
