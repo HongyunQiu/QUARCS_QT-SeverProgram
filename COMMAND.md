@@ -51,7 +51,7 @@
 | ShowAllImageFolder               | Shows all image files in the specified folder.                                                       |
 | MoveFileToUSB                    | Moves specified files to the USB drive.                                                               |
 | DeleteFile                       | Deletes specified files.                                                                                |
-| USBCheck                         | Checks the USB status and remaining space.                                                            |
+| USBCheck                         | Checks the USB drive status and remaining space.                                                        |
 | SolveImage                       | Initiates the solving of an image.                                                                    |
 | startLoopSolveImage              | Starts the loop solving of an image.                                                                   |
 | stopLoopSolveImage               | Stops the loop solving of an image.                                                                    |
