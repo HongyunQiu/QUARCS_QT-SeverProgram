@@ -12,7 +12,7 @@ Ubuntu 22.04
 	sudo apt install build-essential cmake zlib1g-dev libgl1-mesa-dev libdrm-dev gcc g++ 
 	sudo apt install graphviz doxygen gettext git 
 	sudo apt-get install libxcb-xinerama0
-	sudo snap install cmake --classic //此命令可以按照较新版本的cmake，Ubuntu18.04安装版本为3.25.2
+	sudo snap install cmake --classic //This command can install new version cmake，on some ARM board need to install snap for first (sudo apt-get install snapd)
 	sudo apt-get install gnome-keyring
 	sudo apt-get install libusb-1.0.0-dev
 	sudo apt-get install libcfitsio-dev
@@ -45,7 +45,7 @@ Download link for version 3.4.14: https://codeload.github.com/opencv/opencv/zip/
   
 4.Add the following line to the file:
 
-  	/usr/loacal/lib
+  	/usr/local/lib
 		
 5.Save and close, then run:
 
