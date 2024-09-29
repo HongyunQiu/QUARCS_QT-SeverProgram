@@ -1,7 +1,7 @@
 QUARCS_QT-SeverProgram
 =====================
 
-Ubuntu 22.04
+Ubuntu 22.04 on x86/64 platform
 
 1、Install Pre-requisites:
 -
@@ -68,9 +68,9 @@ Download link for version 3.4.14: https://codeload.github.com/opencv/opencv/zip/
 
 	pkg-config opencv --modversion
 
-3、Install QHYCCD SDK
+3、Install QHYCCD SDK 
 -
-Download link for the compressed package: https://www.qhyccd.com/file/repository/publish/SDK/240109/sdk_linux64_24.01.09.tgz
+Download link for the compressed package: https://www.qhyccd.com/file/repository/publish/SDK/240109/sdk_linux64_24.01.09.tgz  (This link is the x86/64 platform. If you are using ARM you need to download the ARM version, it can be found on QHYCCD website)
 
 Installation steps:
 
