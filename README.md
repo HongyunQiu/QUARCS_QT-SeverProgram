@@ -78,7 +78,7 @@ Installation steps:
 	cd sdk_linux64_24.01.09
 	sudo bash install.sh
 
-4、Install indi and indi-3rdparty driver library
+4、Install indi and indi-3rdparty driver library and stellarsolver
 -
 
 Installation steps:
@@ -161,7 +161,14 @@ Installation steps:
 		cmake -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Debug ~/Projects/indi-3rdparty
 		make -j4
 		sudo make install
-   
+
+3. stellarsolver
+      git clone http://github.com/rlancaste/stellarsolver
+      cd stellarsolver/linux-scripts
+      ./installStellarSolverLibraryQt5.sh
+
+after that, if you meet the stellarsolver.h not found. You need to edit the cmakelists.txt in QUARCS_QT-ServerPrograme for the directories
+/user/include/stellarsolver
 
 5、Install QT components:
 -
