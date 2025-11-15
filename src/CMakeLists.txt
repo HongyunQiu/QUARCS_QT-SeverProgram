@@ -5,6 +5,7 @@ project(client LANGUAGES CXX)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
+
 set(QT_COMPONENTS
   Core
   Gui
@@ -18,20 +19,25 @@ set(QT_COMPONENTS
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS ${QT_COMPONENTS})
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS ${QT_COMPONENTS})
-find_package(OpenCV REQUIRED)
+# 仅使用 Qt5（去掉 Qt6）
+find_package(Qt5 REQUIRED COMPONENTS ${QT_COMPONENTS} SerialPort)
 
+find_package(OpenCV REQUIRED)
 find_package(StellarSolver REQUIRED)
 
 add_executable(client
   main.cpp
   websocketclient.h websocketclient.cpp
   mainwindow.h mainwindow.cpp
-  tools.hpp tools.cpp
+  tools.h tools.cpp
   myclient.h myclient.cpp
   websocketthread.h websocketthread.cpp
-  platesolveworker.h platesolveworker.cpp
+  Logger.h Logger.cpp
+  autopolaralignment.h autopolaralignment.cpp
+  autofocus.h autofocus.cpp
+  starsimulator.h starsimulator.cpp
+  mountstate.h
+  SerialDeviceDetector.h SerialDeviceDetector.cpp
 )
 
 target_link_libraries(client PRIVATE
@@ -48,11 +54,13 @@ install(TARGETS client
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
-target_include_directories(client PUBLIC 
+target_include_directories(client PUBLIC
   /usr/include/libindi
-  /usr/local/include/libstellarsolver  # Path to stellarsolver headers
+  /usr/local/include/libstellarsolver
 )
+
 link_directories(${PROJECT_SOURCE_DIR}/usr/lib/x86_64-linux-gnu)
+
 target_link_libraries(client PUBLIC
   -lnova
   -lindidriver
@@ -63,19 +71,25 @@ target_link_libraries(client PUBLIC
 target_include_directories(client PUBLIC
     /usr/local/include
 )
+
 target_link_libraries(client PRIVATE
     qhyccd
     stellarsolver
 )
 
+# 这里全部固定为 Qt5::
 target_link_libraries(client PRIVATE
     ${OpenCV_LIBS}
-    Qt${QT_VERSION_MAJOR}::Core
-    Qt${QT_VERSION_MAJOR}::Gui
-    Qt${QT_VERSION_MAJOR}::Widgets
-    Qt${QT_VERSION_MAJOR}::Concurrent
-    Qt${QT_VERSION_MAJOR}::Network
-    Qt${QT_VERSION_MAJOR}::WebSockets
+    Qt5::Core
+    Qt5::Gui
+    Qt5::Widgets
+    Qt5::Concurrent
+    Qt5::Network
+    Qt5::WebSockets
+    Qt5::SerialPort
     ${StellarSolver_LIBS}
 )
 
+# 复制配置文件到构建目录
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/../qhyccd.ini
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR})

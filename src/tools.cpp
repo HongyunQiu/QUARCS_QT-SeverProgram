@@ -1,4 +1,4 @@
-#include "tools.hpp"
+#include "tools.h"
 #include <vector>
 #include <QFile>
 #include <QString>
@@ -48,7 +48,76 @@ Tools::~Tools() {
 //   if (polerhandle_ != NULL) CloseQHYCCD(polerhandle_);
 //   ReleaseQHYCCDResource();
 }
+// 静态变量存储最后一次检测的FWHM值
+static double g_lastHFR = 0.0;
 
+bool Tools::findStarsByPython_Process(QString filename)
+{
+    QString program = "python3";
+    QStringList arguments;
+    arguments << "../findstars.py" << filename;
+
+    QProcess process;
+    process.start(program, arguments);
+    bool started = process.waitForStarted();
+    if (!started) {
+        qDebug() << "Failed to start the Python script.";
+        return false;
+    }
+
+    bool finished = process.waitForFinished(-1); // -1 means wait indefinitely
+    if (!finished) {
+        qDebug() << "Python script did not finish.";
+        return false;
+    }
+
+    QByteArray output = process.readAllStandardOutput();
+    QByteArray errorOutput = process.readAllStandardError();
+
+    if (!errorOutput.isEmpty()) {
+        qDebug() << "Error from Python script:" << errorOutput;
+        return false;
+    }
+
+    qDebug() << "Output from Python script:" << output;
+    
+    // 解析Python脚本输出中的HFR值
+    QString outputStr = QString::fromUtf8(output);
+    QStringList lines = outputStr.split('\n', Qt::SkipEmptyParts);
+    
+    // 查找包含"最终HFR"的行
+    for (const QString& line : lines) {
+        if (line.contains("最终HFR")) {
+            // 提取HFR数值
+            QRegExp rx("最终HFR\\s*=\\s*([0-9.]+)");
+            if (rx.indexIn(line) != -1) {
+                bool ok;
+                g_lastHFR = rx.cap(1).toDouble(&ok);
+                if (ok) {
+                    qDebug() << "解析到HFR值:" << g_lastHFR;
+                } else {
+                    g_lastHFR = 100; // 默认值，表示较清晰状态
+                }
+            } else {
+                g_lastHFR = 100; // 默认值，表示较清晰状态
+            }
+            break;
+        }
+    }
+    
+    // 如果没有找到HFR值，使用默认值
+    if (g_lastHFR == 0.0) {
+        g_lastHFR = 100; // 默认值，表示较清晰状态
+    }
+    
+    return true;
+}
+
+
+double Tools::getLastHFR()
+{
+    return g_lastHFR;
+}
 void Tools::Initialize() { instance_ = new Tools; }
 
 void Tools::Release() { delete instance_; }
@@ -114,16 +183,25 @@ bool Tools::LoadSystemListFromXml(const QString& fileName) {
     file.close();
 
     if (xmlReader.hasError()) {
-      qDebug() << "loadSystemListFromXml | xmlRead has ERROR";
+      Logger::Log("loadSystemListFromXml | xmlRead has ERROR", LogLevel::ERROR, DeviceType::MAIN);
       return false;
     }
 
   } else {
-    qDebug() << "loadSystemListFromXml | ERROR: Can not open file";
+    Logger::Log("loadSystemListFromXml | ERROR: Can not open file", LogLevel::ERROR, DeviceType::MAIN);
     return false;
   }
 
   // Come from SelectQHYCCDSDKDevice
+  // 修复：确保数组有足够的元素，避免越界访问
+  // 需要至少24个元素（索引0-5和20-23）
+  const size_t requiredSize = 24;
+  if (systemDeviceList_.system_devices.size() < requiredSize) {
+    systemDeviceList_.system_devices.resize(requiredSize);
+    Logger::Log("loadSystemListFromXml | Resized system_devices to " + std::to_string(requiredSize) + " elements", LogLevel::INFO, DeviceType::MAIN);
+  }
+
+  // 现在可以安全地访问这些索引
   systemDeviceList_.system_devices[0].Description = "Mount";
   systemDeviceList_.system_devices[1].Description = "Guider";
   systemDeviceList_.system_devices[2].Description = "PoleCamera";
@@ -166,6 +244,7 @@ void Tools::SaveSystemListToXml(const QString& fileName) {
 
 void Tools::InitSystemDeviceList() {
   // pre-define 32 devices
+  systemDeviceList_.system_devices.clear();
   systemDeviceList_.system_devices.reserve(32);
   SystemDevice dev;
   dev.DeviceIndiName = "";
@@ -199,7 +278,7 @@ int Tools::GetTotalDeviceFromSystemDeviceList() {
   return i;
 }
 
-bool Tools::GetIndexFromSystemDeviceList(const QString& devname, int& index) {
+bool Tools::getIndexFromSystemDeviceListByName(const QString& devname, int& index) {
   int i = 0;
   for (auto dev : systemDeviceList_.system_devices) {
     if (dev.DeviceIndiName == devname) {
@@ -210,15 +289,11 @@ bool Tools::GetIndexFromSystemDeviceList(const QString& devname, int& index) {
   }
   if (i < 32) {
     index = i;
-    qDebug() << "getIndexFromSystemDeviceList | found device in system list. "
-                "device name"
-             << devname << "index" << index;
+    Logger::Log("getIndexFromSystemDeviceListByName | found device in system list. " + devname.toStdString() + "index" + std::to_string(index), LogLevel::INFO, DeviceType::MAIN);
     return true;
   } else {
     index = 0;
-    qDebug() << "getIndexFromSystemDeviceList | not found device in system "
-                "list, devname"
-             << devname;
+    Logger::Log("getIndexFromSystemDeviceListByName | not found device in system list, devname" + devname.toStdString(), LogLevel::INFO, DeviceType::MAIN);
     return false;
   }
 }
@@ -240,8 +315,7 @@ void Tools::readDriversListFromFiles(const std::string &filename, DriversList &d
     QFile file(QString::fromStdString(filename));
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
     {
-        // 处理打开文件失败的情况
-        qDebug() << "打开文件失败";
+        Logger::Log("readDriversListFromFiles | Fail to open Drivers List file.", LogLevel::ERROR, DeviceType::MAIN);
         return;
     }
     QXmlStreamReader xml(&file);
@@ -277,7 +351,7 @@ void Tools::readDriversListFromFiles(const std::string &filename, DriversList &d
 
     if (dir == nullptr)
     {
-        qDebug() << "Unable to find INDI drivers directory,Please make sure the path is true";
+        Logger::Log("readDriversListFromFiles | Unable to find INDI drivers directory, Please make sure the path is true.", LogLevel::ERROR, DeviceType::MAIN);
         return;
     }
 
@@ -300,8 +374,7 @@ void Tools::readDriversListFromFiles(const std::string &filename, DriversList &d
                 QFile file(QString::fromStdString(xmlpath));
                 if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
                 {
-                    // 处理打开文件失败的情况
-                    qDebug() << "Open File faild!!!";
+                    Logger::Log("readDriversListFromFiles | Open File failed!!!", LogLevel::ERROR, DeviceType::MAIN);
                 }
 
                 QXmlStreamReader xml(&file);
@@ -373,79 +446,236 @@ void Tools::readDriversListFromFiles(const std::string &filename, DriversList &d
 
 void Tools::printDevGroups2(const DriversList driver_list)
 {
-    qDebug("printDevGroups2===============================");
+    Logger::Log("===============Group List================", LogLevel::INFO, DeviceType::MAIN);
     // qDebug() << "Number of groups:" << driver_list.dev_groups.size();
     for (int i = 0; i < driver_list.dev_groups.size(); i++)
     {
         // qDebug() << QString::fromStdString(driver_list.dev_groups[i].group);
-        qDebug() << driver_list.dev_groups[i].group;
+        Logger::Log("printDevGroups2 | " + driver_list.dev_groups[i].group.toStdString(), LogLevel::INFO, DeviceType::MAIN);
         // qDebug() << "Number of devices:" << driver_list.dev_groups[i].devices.size();
         for (int j = 0; j < driver_list.dev_groups[i].devices.size(); j++)
         {
-            qDebug() << QString::fromStdString(driver_list.dev_groups[i].devices[j].driver_name) << QString::fromStdString(driver_list.dev_groups[i].devices[j].version) << QString::fromStdString(driver_list.dev_groups[i].devices[j].label);
+            Logger::Log("printDevGroups2 | " + driver_list.dev_groups[i].devices[j].driver_name + " " + driver_list.dev_groups[i].devices[j].version + " " + driver_list.dev_groups[i].devices[j].label, LogLevel::INFO, DeviceType::MAIN);
         }
     }
 }
 
-void Tools::printSystemDeviceList(SystemDeviceList s){
-    //starndard sequence
-    // s[0]: Mount
-    // s[1]: Guider
-    // s[2]: Pole Camera (polemaster)
-    // s[3]:
-    // s[4]:
-    // s[5]:
-    // s[6]:
-    // s[7]:
-    // s[8]:
-    // s[9]:
-    // s[10]:
-    // s[11]:
-    // s[12]:
-    // s[13]:
-    // s[14]:
-    // s[15]:
-    // s[16]:
-    // s[17]:
-    // s[18]:
-    // s[19]:
-    // s[20]: Camera #1
-    // s[21]: CFW #1
-    // s[22]: Focuser #1
-    // s[23]: LensCover #1
-
-
-
-
-    qDebug()<<"*****************System Device Selected***************"<<s.system_devices.size();
-    QString dpName;
-    for (int i=0;i<s.system_devices.size();i++){
-          if(s.system_devices[i].dp==NULL) dpName="NULL";
-          else                             dpName=s.system_devices[i].dp->getDeviceName();
-
-          qDebug()<< i << s.system_devices[i].DeviceIndiGroup << s.system_devices[i].DriverFrom << s.system_devices[i].DriverIndiName << s.system_devices[i].DeviceIndiName << s.system_devices[i].Description <<s.system_devices[i].isConnect <<dpName;
+void Tools::printSystemDeviceList(const SystemDeviceList& s){
+    try {
+        // 在最开始就打印基本信息
+        Logger::Log("===============System Device Selected================", LogLevel::INFO, DeviceType::MAIN);
+        // Logger::Log("printSystemDeviceList | Function started", LogLevel::INFO, DeviceType::MAIN);
+        
+        // 检查引用本身是否有效（虽然引用理论上不能为空，但让我们检查一下）
+        try {
+            // Logger::Log("printSystemDeviceList | Checking parameter validity...", LogLevel::INFO, DeviceType::MAIN);
+            
+            // 尝试访问 currentDeviceCode 来测试对象是否有效
+            int deviceCode = s.currentDeviceCode;
+            // Logger::Log("printSystemDeviceList | currentDeviceCode: " + std::to_string(deviceCode), LogLevel::INFO, DeviceType::MAIN);
+            
+            // 检查 system_devices 容器本身
+            // Logger::Log("printSystemDeviceList | Checking system_devices container...", LogLevel::INFO, DeviceType::MAIN);
+            
+            // 先检查容器是否可以安全访问
+            const QVector<SystemDevice>& devices = s.system_devices;
+            // Logger::Log("printSystemDeviceList | Got reference to system_devices", LogLevel::INFO, DeviceType::MAIN);
+            
+            // 检查容器大小
+            int deviceCount = devices.size();
+            // Logger::Log("printSystemDeviceList | system_devices.size(): " + std::to_string(deviceCount), LogLevel::INFO, DeviceType::MAIN);
+            
+            // 检查容器是否为空
+            bool isEmpty = devices.isEmpty();
+            // Logger::Log("printSystemDeviceList | system_devices.isEmpty(): " + std::string(isEmpty ? "true" : "false"), LogLevel::INFO, DeviceType::MAIN);
+            
+            // 检查容器容量
+            int capacity = devices.capacity();
+            // Logger::Log("printSystemDeviceList | system_devices.capacity(): " + std::to_string(capacity), LogLevel::INFO, DeviceType::MAIN);
+            
+            if (isEmpty) {
+                // Logger::Log("printSystemDeviceList | system_devices is empty", LogLevel::WARNING, DeviceType::MAIN);
+                // Logger::Log("******************************************************", LogLevel::INFO, DeviceType::MAIN);
+                return;
+            }
+            
+            if (deviceCount <= 0) {
+                // Logger::Log("printSystemDeviceList | Invalid device count: " + std::to_string(deviceCount), LogLevel::ERROR, DeviceType::MAIN);
+                // Logger::Log("******************************************************", LogLevel::INFO, DeviceType::MAIN);
+                return;
+            }
+            
+            if (deviceCount > 100) {
+                // Logger::Log("printSystemDeviceList | Suspiciously large device count: " + std::to_string(deviceCount), LogLevel::WARNING, DeviceType::MAIN);
+                // Logger::Log("******************************************************", LogLevel::INFO, DeviceType::MAIN);
+                return;
+            }
+            
+            // Logger::Log("printSystemDeviceList | Starting to iterate through devices...", LogLevel::INFO, DeviceType::MAIN);
+            
+            // 尝试访问第一个设备来测试
+            if (deviceCount > 0) {
+                try {
+                    // Logger::Log("printSystemDeviceList | Checking first device...", LogLevel::INFO, DeviceType::MAIN);
+                    const SystemDevice& firstDevice = devices[0];
+                    // Logger::Log("printSystemDeviceList | First device accessed successfully", LogLevel::INFO, DeviceType::MAIN);
+                    
+                    // 检查第一个设备的基本信息
+                    QString desc = firstDevice.Description;
+                    // Logger::Log("printSystemDeviceList | First device Description: " + (desc.isEmpty() ? "EMPTY" : desc.toStdString()), LogLevel::INFO, DeviceType::MAIN);
+                    
+                    int group = firstDevice.DeviceIndiGroup;
+                    // Logger::Log("printSystemDeviceList | First device DeviceIndiGroup: " + std::to_string(group), LogLevel::INFO, DeviceType::MAIN);
+                    
+                    bool isConnect = firstDevice.isConnect;
+                    // Logger::Log("printSystemDeviceList | First device isConnect: " + std::string(isConnect ? "true" : "false"), LogLevel::INFO, DeviceType::MAIN);
+                    
+                    // 检查设备指针
+                    INDI::BaseDevice* dp = firstDevice.dp;
+                    // Logger::Log("printSystemDeviceList | First device dp: " + std::string(dp ? "NOT_NULL" : "NULL"), LogLevel::INFO, DeviceType::MAIN);
+                    
+                } catch (const std::exception& e) {
+                    // Logger::Log("printSystemDeviceList | Error accessing first device: " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+                    // Logger::Log("******************************************************", LogLevel::INFO, DeviceType::MAIN);
+                    return;
+                } catch (...) {
+                    // Logger::Log("printSystemDeviceList | Unknown error accessing first device", LogLevel::ERROR, DeviceType::MAIN);
+                    // Logger::Log("******************************************************", LogLevel::INFO, DeviceType::MAIN);
+                    return;
+                }
+            }
+            
+            // 现在开始正常的循环
+            // Logger::Log("printSystemDeviceList | Starting main loop...", LogLevel::INFO, DeviceType::MAIN);
+            
+            for (int i = 0; i < deviceCount; i++) {
+                try {
+                    // Logger::Log("printSystemDeviceList | Processing device " + std::to_string(i) + "...", LogLevel::INFO, DeviceType::MAIN);
+                    
+                    // 检查索引是否有效
+                    if (i >= devices.size()) {
+                        // Logger::Log("printSystemDeviceList | Index out of bounds: " + std::to_string(i), LogLevel::ERROR, DeviceType::MAIN);
+                        break;
+                    }
+                    
+                    const SystemDevice& device = devices[i];
+                    // Logger::Log("printSystemDeviceList | Got device reference for index " + std::to_string(i), LogLevel::INFO, DeviceType::MAIN);
+                    
+                    // 获取设备名称
+                    QString dpName = "NULL";
+                    if (device.dp != nullptr && device.dp != NULL) {
+                        // Logger::Log("printSystemDeviceList | 获取到当前设备存在 ",LogLevel::INFO,DeviceType::MAIN);
+                        try {
+                            const char* deviceName = device.dp->getDeviceName();
+                            // Logger::Log("printSystemDeviceList | 获取到当前设备存在 1",LogLevel::INFO,DeviceType::MAIN);
+                            if (deviceName != nullptr) {
+                                dpName = QString::fromUtf8(deviceName);
+                                if (dpName.isEmpty()) {
+                                    dpName = "EMPTY_NAME";
+                                }
+                            } else {
+                                dpName = "NULL_NAME";
+                            }
+                        } catch (const std::exception& e) {
+                            dpName = "ERROR_GETTING_NAME";
+                            // Logger::Log("printSystemDeviceList | Error getting device name for device " + std::to_string(i) + ": " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+                        } catch (...) {
+                            dpName = "UNKNOWN_ERROR";
+                            // Logger::Log("printSystemDeviceList | Unknown error getting device name for device " + std::to_string(i), LogLevel::ERROR, DeviceType::MAIN);
+                        }
+                    }
+                    
+                    // 检查 DriverIndiName 是否为空
+                    if (!device.DriverIndiName.isEmpty()) {
+                        try {
+                            // 使用更安全的字符串操作
+                            QString logMessage = QString("printSystemDeviceList | %1 %2 %3 %4 %5 %6 %7 %8")
+                                .arg(i)
+                                .arg(device.DeviceIndiGroup)
+                                .arg(device.DriverFrom.isEmpty() ? "NULL" : device.DriverFrom)
+                                .arg(device.DriverIndiName.isEmpty() ? "NULL" : device.DriverIndiName)
+                                .arg(device.DeviceIndiName.isEmpty() ? "NULL" : device.DeviceIndiName)
+                                .arg(device.Description.isEmpty() ? "NULL" : device.Description)
+                                .arg(device.isConnect ? "true" : "false")
+                                .arg(dpName.isEmpty() ? "NULL" : dpName);
+                            
+                            Logger::Log(logMessage.toStdString(), LogLevel::INFO, DeviceType::MAIN);
+                        } catch (const std::exception& e) {
+                            // Logger::Log("printSystemDeviceList | Error converting strings for device " + std::to_string(i) + ": " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+                        } catch (...) {
+                            // Logger::Log("printSystemDeviceList | Unknown error converting strings for device " + std::to_string(i), LogLevel::ERROR, DeviceType::MAIN);
+                        }
+                    }
+                    
+                    // Logger::Log("printSystemDeviceList | Completed processing device " + std::to_string(i), LogLevel::INFO, DeviceType::MAIN);
+                    
+                } catch (const std::exception& e) {
+                    // Logger::Log("printSystemDeviceList | Error processing device " + std::to_string(i) + ": " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+                } catch (...) {
+                    // Logger::Log("printSystemDeviceList | Unknown error processing device " + std::to_string(i), LogLevel::ERROR, DeviceType::MAIN);
+                }
+            }
+            
+            // Logger::Log("printSystemDeviceList | Completed main loop", LogLevel::INFO, DeviceType::MAIN);
+            
+        } catch (const std::exception& e) {
+            // Logger::Log("printSystemDeviceList | Error in parameter validation: " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+        } catch (...) {
+            // Logger::Log("printSystemDeviceList | Unknown error in parameter validation", LogLevel::ERROR, DeviceType::MAIN);
+        }
+        
+    } catch (const std::exception& e) {
+        // Logger::Log("printSystemDeviceList | Critical error: " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+    } catch (...) {
+        // Logger::Log("printSystemDeviceList | Unknown critical error", LogLevel::ERROR, DeviceType::MAIN);
     }
-    qDebug() << "******************************************************";
+    
+    Logger::Log("******************************************************", LogLevel::INFO, DeviceType::MAIN);
 }
 
-void Tools::makeConfigFolder() {
-  std::string directory = "config"; // 要创建的文件夹名
+QStringList Tools::getCameraNumFromSystemDeviceList(const SystemDeviceList& s) {
+  QStringList cameras;
+
+  if (s.system_devices[1].Description != "") {
+    cameras << "Guider";
+  }
+
+  if (s.system_devices[2].Description != "") {
+    cameras << "PoleCamera";
+  }
+
+  if (s.system_devices[20].Description != "") {
+    cameras << "MainCamera";
+  }
+
+  return cameras;
+}
+void Tools::makeConfigFile() {
+    std::string directory = "config";  // 要创建的文件夹名
+    std::string filename = "config/config.ini";  // 配置文件路径
 
     // 如果目录不存在，则创建
-    if (!std::filesystem::exists(directory))
-    {
-        if (std::filesystem::create_directory(directory))
-        {
-            std::cout << "文件夹创建成功: " << directory << std::endl;
+    if (!std::filesystem::exists(directory)) {
+        if (std::filesystem::create_directory(directory)) {
+            Logger::Log("makeConfigFile | Configuration folder created successfully: " + directory, LogLevel::INFO, DeviceType::MAIN);
+        } else {
+            Logger::Log("makeConfigFile | An error occurred while creating the configuration folder.", LogLevel::ERROR, DeviceType::MAIN);
+            return;  // 如果文件夹创建失败，退出
         }
-        else
-        {
-            std::cerr << "创建文件夹时发生错误" << std::endl;
-        }
+    } else {
+        Logger::Log("makeConfigFile | The configuration folder already exists: " + directory, LogLevel::INFO, DeviceType::MAIN);
     }
-    else
-    {
-        std::cout << "文件夹已存在: " << directory << std::endl;
+
+    // 如果配置文件不存在，则创建空配置文件
+    if (!std::filesystem::exists(filename)) {
+        std::ofstream configFile(filename);  // 在 config 文件夹中创建空文件
+        if (configFile) {
+            Logger::Log("makeConfigFile | Configuration file created successfully: " + filename, LogLevel::INFO, DeviceType::MAIN);
+        } else {
+            Logger::Log("makeConfigFile | An error occurred while creating the configuration file.", LogLevel::ERROR, DeviceType::MAIN);
+        }
+    } else {
+        Logger::Log("makeConfigFile | The configuration file already exists: " + filename, LogLevel::INFO, DeviceType::MAIN);
     }
 }
 
@@ -457,259 +687,798 @@ void Tools::makeImageFolder() {
     {
         if (std::filesystem::create_directory(directory))
         {
-            std::cout << "文件夹创建成功: " << directory << std::endl;
+            Logger::Log("makeImageFolder | Image folder created successfully: " + directory, LogLevel::INFO, DeviceType::MAIN);
 
             // 创建子文件夹 CaptureImage
             std::string captureDirectory = directory + "/CaptureImage";
             if (std::filesystem::create_directory(captureDirectory))
             {
-                std::cout << "子文件夹创建成功: " << captureDirectory << std::endl;
+                Logger::Log("makeImageFolder | Subfolder created successfully: " + captureDirectory, LogLevel::INFO, DeviceType::MAIN);
             }
             else
             {
-                std::cerr << "创建子文件夹时发生错误" << std::endl;
+                Logger::Log("makeImageFolder | Error occurred while creating CaptureImage subfolders.", LogLevel::ERROR, DeviceType::MAIN);
             }
 
             // 创建子文件夹 ScheduleImage
             std::string scheduleDirectory = directory + "/ScheduleImage";
             if (std::filesystem::create_directory(scheduleDirectory))
             {
-                std::cout << "子文件夹创建成功: " << scheduleDirectory << std::endl;
+                Logger::Log("makeImageFolder | Subfolder created successfully: " + scheduleDirectory, LogLevel::INFO, DeviceType::MAIN);
             }
             else
             {
-                std::cerr << "创建子文件夹时发生错误" << std::endl;
+                Logger::Log("makeImageFolder | Error occurred while creating ScheduleImage subfolders.", LogLevel::ERROR, DeviceType::MAIN);
+            }
+             // 创建子文件夹 solveFailedImage
+            std::string solveFailedDirectory = directory + "/solveFailedImage";
+            if (std::filesystem::create_directory(solveFailedDirectory))
+            {
+                Logger::Log("makeImageFolder | Subfolder created successfully: " + solveFailedDirectory, LogLevel::INFO, DeviceType::MAIN);
+            }
+            else
+            {
+                Logger::Log("makeImageFolder | Error occurred while creating solveFailedImage subfolders.", LogLevel::ERROR, DeviceType::MAIN);
             }
         }
         else
         {
-            std::cerr << "创建文件夹时发生错误" << std::endl;
+            Logger::Log("makeImageFolder | An error occurred while creating the image folder.", LogLevel::ERROR, DeviceType::MAIN);
         }
     }
     else
     {
-        std::cout << "文件夹已存在: " << directory << std::endl;
+        Logger::Log("makeImageFolder | The image folder already exists: " + directory, LogLevel::INFO, DeviceType::MAIN);
     }
 }
 
-void Tools::saveSystemDeviceList(SystemDeviceList deviceList)
-{
-  std::string directory = "config"; // 配置文件夹名
-  std::string filename = directory + "/device_connect.dat"; // 在配置文件夹中创建文件
+void Tools::saveSystemDeviceList(SystemDeviceList deviceList) {
+    std::string directory = "config";  // 配置文件夹名
+    std::string filename = directory + "/config.ini";  // 配置文件路径
 
-  std::ofstream outfile(filename, std::ios::binary);
+    // 检查文件夹是否存在，如果不存在就创建
+    if (!std::filesystem::exists(directory)) {
+        if (!std::filesystem::create_directory(directory)) {
+            Logger::Log("saveSystemDeviceList | An error occurred while creating the configuration folder: " + directory, LogLevel::ERROR, DeviceType::MAIN);
+            return;
+        }
+    }
 
-  if (!outfile.is_open()) {
-        std::cerr << "打开文件写入时发生错误: " << filename << std::endl;
+    // 读取现有配置文件的内容
+    std::ifstream infile(filename);
+    std::stringstream fileContent;
+    std::string line;
+    bool isInLastConnectedDeviceSection = false;
+
+    // 读取现有文件内容
+    while (std::getline(infile, line)) {
+        fileContent << line << "\n";
+        // 如果遇到 [LastConnectedDevice] 部分，标记为开始位置
+        if (line == "[LastConnectedDevice]") {
+            isInLastConnectedDeviceSection = true;
+        }
+        // 如果已经在 [LastConnectedDevice] 部分，直到遇到空行或另一个部分则跳出
+        if (isInLastConnectedDeviceSection && line.empty()) {
+            isInLastConnectedDeviceSection = false;
+        }
+    }
+    infile.close();
+
+    // 如果文件已经包含了 [LastConnectedDevice] 部分，则移除旧的内容
+    std::string content = fileContent.str();
+    size_t pos = content.find("[LastConnectedDevice]");
+    if (pos != std::string::npos) {
+        size_t endPos = content.find("(End of device list)\n\n", pos) + std::string("(End of device list)\n\n").length();  // 找到 [LastConnectedDevice] 部分结束的位置
+        if (endPos != std::string::npos) {
+            content.erase(pos, endPos - pos);  // 删除旧的设备列表部分
+        }
+    }
+
+    // 打开文件进行写入（覆盖模式）
+    std::ofstream outfile(filename, std::ios::out | std::ios::trunc);  // 打开文件以覆盖内容
+    if (!outfile.is_open()) {
+        Logger::Log("saveSystemDeviceList | An error occurred while opening the configuration file for writing: " + filename, LogLevel::ERROR, DeviceType::MAIN);
         return;
     }
 
+    // 先写入文件的原始内容（去掉 [LastConnectedDevice] 部分）
+    outfile << content;
+
+    // 写入新的 [LastConnectedDevice] 部分
+    outfile << "[LastConnectedDevice]\n";
+
+    // 遍历设备列表并写入到配置文件
     for (const auto& device : deviceList.system_devices) {
-        // 转换 QString 成员为 UTF-8 字符串
         QByteArray descriptionUtf8 = device.Description.toUtf8();
         QByteArray deviceIndiNameUtf8 = device.DeviceIndiName.toUtf8();
         QByteArray driverIndiNameUtf8 = device.DriverIndiName.toUtf8();
         QByteArray driverFromUtf8 = device.DriverFrom.toUtf8();
 
-        // 写入 QString 大小信息和数据
-        size_t descriptionSize = static_cast<size_t>(descriptionUtf8.size());
-        outfile.write(reinterpret_cast<const char*>(&descriptionSize), sizeof(size_t));
-        outfile.write(descriptionUtf8.constData(), descriptionSize);
-
-        outfile.write(reinterpret_cast<const char*>(&device.DeviceIndiGroup), sizeof(int));
-
-        size_t deviceIndiNameSize = static_cast<size_t>(deviceIndiNameUtf8.size());
-        outfile.write(reinterpret_cast<const char*>(&deviceIndiNameSize), sizeof(size_t));
-        outfile.write(deviceIndiNameUtf8.constData(), deviceIndiNameSize);
-
-        size_t driverIndiNameSize = static_cast<size_t>(driverIndiNameUtf8.size());
-        outfile.write(reinterpret_cast<const char*>(&driverIndiNameSize), sizeof(size_t));
-        outfile.write(driverIndiNameUtf8.constData(), driverIndiNameSize);
-
-        size_t driverFromSize = static_cast<size_t>(driverFromUtf8.size());
-        outfile.write(reinterpret_cast<const char*>(&driverFromSize), sizeof(size_t));
-        outfile.write(driverFromUtf8.constData(), driverFromSize);
-
-        outfile.write(reinterpret_cast<const char*>(&device.isConnect), sizeof(bool));
+        // 写入设备信息到配置文件
+        outfile << "Description=" << descriptionUtf8.constData() << "\n";
+        outfile << "DeviceIndiGroup=" << device.DeviceIndiGroup << "\n";
+        outfile << "DeviceIndiName=" << deviceIndiNameUtf8.constData() << "\n";
+        outfile << "DriverIndiName=" << driverIndiNameUtf8.constData() << "\n";
+        outfile << "DriverFrom=" << driverFromUtf8.constData() << "\n";
+        outfile << "isConnect=" << (device.isConnect ? "true" : "false") << "\n";
+        outfile << "\n";  // 每个设备之间空一行，便于阅读
     }
+    outfile << "(End of device list)\n\n";
 
+    // 关闭文件
     outfile.close();
+    Logger::Log("saveSystemDeviceList | The device list has been saved to the configuration file: " + filename, LogLevel::INFO, DeviceType::MAIN);
 }
 
-SystemDeviceList Tools::readSystemDeviceList()
-{
-  SystemDeviceList deviceList;
-  std::string directory = "config"; // 配置文件夹名
-  std::string filename = directory + "/device_connect.dat"; // 在配置文件夹中创建文件
-  std::ifstream infile(filename, std::ios::binary);
+SystemDeviceList Tools::readSystemDeviceList() {
+    SystemDeviceList deviceList;
+    std::string filename = "config/config.ini"; // INI 配置文件路径
+    std::ifstream infile(filename);
 
-  if (!infile.is_open()) {
-        std::cerr << "打开文件读取时发生错误: " << filename << std::endl;
+    if (!infile.is_open()) {
+        Logger::Log("readSystemDeviceList | Error occurred while opening file for reading: " + filename, LogLevel::ERROR, DeviceType::MAIN);
         return deviceList;
     }
 
-    while (true) {
-        SystemDevice device;
+    std::string line;
+    bool inLastConnectedDeviceSection = false;
+    SystemDevice currentDevice;
+    std::map<std::string, std::string> sectionData;
 
-        // 读取 QString 成员
-        size_t descriptionSize;
-        infile.read(reinterpret_cast<char*>(&descriptionSize), sizeof(size_t));
-        if (infile.eof()) {
-            break;
+    // 逐行读取 INI 文件
+    while (std::getline(infile, line)) {
+        // 检查是否进入了 [LastConnectedDevice] 部分
+        if (line.find("[LastConnectedDevice]") != std::string::npos) {
+            inLastConnectedDeviceSection = true;
+            continue; // 跳过这一行，开始读取数据
         }
-        std::vector<char> descriptionBuffer(descriptionSize);
-        infile.read(descriptionBuffer.data(), descriptionSize);
-        device.Description = QString::fromUtf8(descriptionBuffer.data(), static_cast<int>(descriptionSize));
 
-        infile.read(reinterpret_cast<char*>(&device.DeviceIndiGroup), sizeof(int));
+        if (inLastConnectedDeviceSection) {
+            // 遇到下一个部分或空行，停止读取当前部分
+            if (line.empty() || line[0] == '[') {
+                // 这里保存当前设备并重置
+                if (!sectionData.empty()) {
+                    // 用 sectionData 填充当前设备
+                    currentDevice.Description = QString::fromStdString(sectionData["Description"]);
+                    currentDevice.DeviceIndiGroup = -1;
+                    currentDevice.DeviceIndiName = "";
+                    currentDevice.DriverIndiName = QString::fromStdString(sectionData["DriverIndiName"]);
+                    currentDevice.DriverFrom = QString::fromStdString(sectionData["DriverFrom"]);
+                    currentDevice.dp = NULL;
+                    currentDevice.isConnect = false;
+                    currentDevice.isBind = false;
 
-        size_t deviceIndiNameSize;
-        infile.read(reinterpret_cast<char*>(&deviceIndiNameSize), sizeof(size_t));
-        std::vector<char> deviceIndiNameBuffer(deviceIndiNameSize);
-        infile.read(deviceIndiNameBuffer.data(), deviceIndiNameSize);
-        device.DeviceIndiName = QString::fromUtf8(deviceIndiNameBuffer.data(), static_cast<int>(deviceIndiNameSize));
+                    // 将当前设备添加到设备列表
+                    deviceList.system_devices.push_back(currentDevice);
+                }
+                // 重置
+                sectionData.clear();
 
-        size_t driverIndiNameSize;
-        infile.read(reinterpret_cast<char*>(&driverIndiNameSize), sizeof(size_t));
-        std::vector<char> driverIndiNameBuffer(driverIndiNameSize);
-        infile.read(driverIndiNameBuffer.data(), driverIndiNameSize);
-        device.DriverIndiName = QString::fromUtf8(driverIndiNameBuffer.data(), static_cast<int>(driverIndiNameSize));
-
-        size_t driverFromSize;
-        infile.read(reinterpret_cast<char*>(&driverFromSize), sizeof(size_t));
-        std::vector<char> driverFromBuffer(driverFromSize);
-        infile.read(driverFromBuffer.data(), driverFromSize);
-        device.DriverFrom = QString::fromUtf8(driverFromBuffer.data(), static_cast<int>(driverFromSize));
-
-        infile.read(reinterpret_cast<char*>(&device.isConnect), sizeof(bool));
-
-        deviceList.system_devices.push_back(device);
+                if (!line.empty() && line[0] == '[') {
+                    // 如果遇到新的节，跳出循环
+                    break;
+                }
+            } else {
+                // 解析键值对
+                std::string key, value;
+                std::istringstream lineStream(line);
+                if (std::getline(std::getline(lineStream, key, '='), value)) {
+                    sectionData[key] = value;
+                }
+            }
+        }
     }
 
     infile.close();
-
     return deviceList;
 }
 
 void Tools::saveExpTimeList(QString List)
 {
-  std::string directory = "config";                      // 配置文件夹名
-  std::string filename = directory + "/ExpTimeList.dat"; // 在配置文件夹中创建文件
+    std::string directory = "config";  // 配置文件夹名
+    std::string filename = directory + "/config.ini";  // 配置文件路径
 
-  std::ofstream outfile(filename, std::ios::binary);
+    // 检查文件夹是否存在，如果不存在就创建
+    if (!std::filesystem::exists(directory)) {
+        if (!std::filesystem::create_directory(directory)) {
+            Logger::Log("saveExpTimeList | An error occurred while creating the configuration folder: " + directory, LogLevel::ERROR, DeviceType::MAIN);
+            return;
+        }
+    }
 
-  if (!outfile.is_open())
-  {
-    std::cerr << "打开文件写入时发生错误: " << filename << std::endl;
-    return;
-  }
+    // 读取现有配置文件的内容
+    std::ifstream infile(filename);
+    std::stringstream fileContent;
+    std::string line;
+    bool isInExpTimeListSection = false;
 
-  QByteArray ExpTimeListUtf8 = List.toUtf8();
+    // 读取现有文件内容
+    while (std::getline(infile, line)) {
+        fileContent << line << "\n";
+        // 如果遇到 [ExpTimeList] 部分，标记为开始位置
+        if (line == "[ExpTimeList]") {
+            isInExpTimeListSection = true;
+        }
+        // 如果已经在 [LastConnectedDevice] 部分，直到遇到空行或另一个部分则跳出
+        if (isInExpTimeListSection && line.empty()) {
+            isInExpTimeListSection = false;
+        }
+    }
+    infile.close();
 
-  // 写入 QString 大小信息和数据
-  size_t ExpTimeListSize = static_cast<size_t>(ExpTimeListUtf8.size());
-  outfile.write(reinterpret_cast<const char *>(&ExpTimeListSize), sizeof(size_t));
-  outfile.write(ExpTimeListUtf8.constData(), ExpTimeListSize);
+    // 如果文件已经包含了 [LastConnectedDevice] 部分，则移除旧的内容
+    std::string content = fileContent.str();
+    size_t pos = content.find("[ExpTimeList]");
+    if (pos != std::string::npos) {
+        size_t endPos = content.find("(End of ExpTime list)\n\n", pos) + std::string("(End of ExpTime list)\n\n").length();  // 找到 [ExpTimeList] 部分结束的位置
+        if (endPos != std::string::npos) {
+            content.erase(pos, endPos - pos);  // 删除旧的设备列表部分
+        }
+    }
 
-  outfile.close();
+    // 打开文件进行写入（覆盖模式）
+    std::ofstream outfile(filename, std::ios::out | std::ios::trunc);  // 打开文件以覆盖内容
+    if (!outfile.is_open()) {
+        Logger::Log("saveExpTimeList | An error occurred while opening the configuration file for writing: " + filename, LogLevel::ERROR, DeviceType::MAIN);
+        return;
+    }
+
+    // 先写入文件的原始内容（去掉 [LastConnectedDevice] 部分）
+    outfile << content;
+
+    // 写入新的 [LastConnectedDevice] 部分
+    outfile << "[ExpTimeList]\n";
+
+    QByteArray ExpTimeListUtf8 = List.toUtf8();
+
+    // 将 QString 转换为 UTF-8 格式的字符串，并保存
+    outfile << "ExpTimeList=" << ExpTimeListUtf8.constData() << "\n";
+
+    outfile << "(End of ExpTime list)\n\n";
+
+    outfile.close();
+}
+
+void Tools::saveParameter(const QString& deviceCategory, const QString& functionCategory, const QString& parameterValue) {
+    std::string directory = "config";  // 配置文件夹名
+    std::string filename = directory + "/config.ini";  // 配置文件路径
+
+    // 检查文件夹是否存在，如果不存在就创建
+    if (!std::filesystem::exists(directory)) {
+        if (!std::filesystem::create_directory(directory)) {
+            Logger::Log("saveParameter | An error occurred while creating the configuration folder: " + directory, LogLevel::ERROR, DeviceType::MAIN);
+            return;
+        }
+    }
+
+    // 读取现有配置文件的内容
+    std::ifstream infile(filename);
+    std::stringstream fileContent;
+    std::string line;
+    bool isInSection = false;
+    std::string sectionHeader = "[" + deviceCategory.toStdString() + "]";
+    std::string endMarker = "(End of " + deviceCategory.toStdString() + " Parameter)";
+
+    // 读取现有文件内容
+    while (std::getline(infile, line)) {
+        fileContent << line << "\n";
+    }
+    infile.close();
+
+    // 查找并更新指定部分
+    std::string content = fileContent.str();
+    size_t pos = content.find(sectionHeader);
+    if (pos != std::string::npos) {
+        size_t endPos = content.find(endMarker, pos);
+        if (endPos != std::string::npos) {
+            // 查找并更新现有参数
+            size_t paramPos = content.find(functionCategory.toStdString() + "=", pos);
+            if (paramPos != std::string::npos && paramPos < endPos) {
+                size_t lineEnd = content.find("\n", paramPos);
+                content.replace(paramPos, lineEnd - paramPos, functionCategory.toStdString() + "=" + parameterValue.toStdString());
+            } else {
+                // 在结束标记之前插入新的参数
+                content.insert(endPos, functionCategory.toStdString() + "=" + parameterValue.toStdString() + "\n");
+            }
+        } else {
+            // 如果没有找到结束标记，添加新的参数和结束标记
+            content += sectionHeader + "\n" + functionCategory.toStdString() + "=" + parameterValue.toStdString() + "\n" + endMarker + "\n";
+        }
+    } else {
+        // 如果没有找到该部分，添加新的部分
+        content += sectionHeader + "\n" + functionCategory.toStdString() + "=" + parameterValue.toStdString() + "\n" + endMarker + "\n\n";
+    }
+
+    // 打开文件进行写入（覆盖模式）
+    std::ofstream outfile(filename, std::ios::out | std::ios::trunc);  // 打开文件以覆盖内容
+    if (!outfile.is_open()) {
+        Logger::Log("saveParameter | An error occurred while opening the configuration file for writing: " + filename, LogLevel::ERROR, DeviceType::MAIN);
+        return;
+    }
+
+    // 写入更新后的内容
+    outfile << content;
+    outfile.close();
+}
+
+QMap<QString, QString> Tools::readParameters(const QString& deviceCategory) {
+    std::string filename = "config/config.ini";  // 配置文件路径
+    std::ifstream infile(filename);
+
+    QMap<QString, QString> parameters;
+
+    if (!infile.is_open()) {
+        Logger::Log("readParameters | Error occurred while opening file for reading: " + filename, LogLevel::ERROR, DeviceType::MAIN);
+        return parameters;
+    }
+
+    std::string line;
+    bool inSection = false;
+    std::string sectionHeader = "[" + deviceCategory.toStdString() + "]";
+    std::string endMarker = "(End of " + deviceCategory.toStdString() + " Parameter)";
+
+    // 逐行读取 INI 文件
+    while (std::getline(infile, line)) {
+        // 检查是否进入了指定的部分
+        if (line == sectionHeader) {
+            inSection = true;
+            continue; // 跳过这一行，开始读取数据
+        }
+
+        if (inSection) {
+            // 遇到结束标记或下一个部分，停止读取当前部分
+            if (line.empty() || line == endMarker || line[0] == '[') {
+                break;
+            }
+
+            // 解析键值对
+            std::string key, value;
+            std::istringstream lineStream(line);
+            if (std::getline(std::getline(lineStream, key, '='), value)) {
+                parameters.insert(QString::fromStdString(key), QString::fromStdString(value));
+            }
+        }
+    }
+
+    infile.close();
+    return parameters;
 }
 
 QString Tools::readExpTimeList()
 {
-  std::string directory = "config";                      // 配置文件夹名
-  std::string filename = directory + "/ExpTimeList.dat"; // 在配置文件夹中创建文件
-  std::ifstream infile(filename, std::ios::binary);
+    QString ExpTimeList;
+    std::string filename = "config/config.ini"; // INI 配置文件路径
+    std::ifstream infile(filename);
 
-  if (!infile.is_open())
-  {
-    std::cerr << "打开文件读取时发生错误: " << filename << std::endl;
-    return QString();
-  }
+    if (!infile.is_open()) {
+        Logger::Log("readExpTimeList | Error occurred while opening file for reading: " + filename, LogLevel::ERROR, DeviceType::MAIN);
+        return QString();
+    }
 
-  // 读取经验时间列表的大小
-  size_t ExpTimeListSize;
-  infile.read(reinterpret_cast<char *>(&ExpTimeListSize), sizeof(size_t));
+    std::string line;
+    bool inExpTimeListSection = false;
+    SystemDevice currentDevice;
+    std::map<std::string, std::string> sectionData;
 
-  // 分配内存空间用于存储经验时间列表的数据
-  char *buffer = new char[ExpTimeListSize];
+    // 逐行读取 INI 文件
+    while (std::getline(infile, line)) {
+        // 检查是否进入了 [LastConnectedDevice] 部分
+        if (line.find("[ExpTimeList]") != std::string::npos) {
+            inExpTimeListSection = true;
+            continue; // 跳过这一行，开始读取数据
+        }
 
-  // 读取经验时间列表的数据
-  infile.read(buffer, ExpTimeListSize);
+        if (inExpTimeListSection) {
+            // 遇到下一个部分或空行，停止读取当前部分
+            if (line.empty() || line[0] == '[') {
+                // 这里保存当前设备并重置
+                if (!sectionData.empty()) {
+                    // 用 sectionData 填充当前设备
+                    ExpTimeList = QString::fromStdString(sectionData["ExpTimeList"]);
+                }
+                // 重置
+                sectionData.clear();
 
-  // 将读取的数据转换为 QString
-  QString ExpTimeList = QString::fromUtf8(buffer, ExpTimeListSize);
+                if (!line.empty() && line[0] == '[') {
+                    // 如果遇到新的节，跳出循环
+                    break;
+                }
+            } else {
+                // 解析键值对
+                std::string key, value;
+                std::istringstream lineStream(line);
+                if (std::getline(std::getline(lineStream, key, '='), value)) {
+                    sectionData[key] = value;
+                }
+            }
+        }
+    }
 
-  // 释放内存空间
-  delete[] buffer;
-
-  // 关闭文件
-  infile.close();
-
-  return ExpTimeList;
+    infile.close();
+    return ExpTimeList;
 }
 
 void Tools::saveCFWList(QString Name, QString List)
 {
-  std::string directory = "config";                      // 配置文件夹名
-  std::string filename = directory + "/CFWList(" + Name.toStdString() +").dat"; // 在配置文件夹中创建文件
+    std::string directory = "config";  // 配置文件夹名
+    std::string filename = directory + "/config.ini";  // 配置文件路径
 
-  std::ofstream outfile(filename, std::ios::binary);
+    // 检查文件夹是否存在，如果不存在就创建
+    if (!std::filesystem::exists(directory)) {
+        if (!std::filesystem::create_directory(directory)) {
+            Logger::Log("saveCFWList | An error occurred while creating the configuration folder: " + directory, LogLevel::ERROR, DeviceType::MAIN);
+            return;
+        }
+    }
 
-  if (!outfile.is_open())
-  {
-    std::cerr << "打开文件写入时发生错误: " << filename << std::endl;
-    return;
-  }
+    // 读取现有配置文件的内容
+    std::ifstream infile(filename);
+    std::stringstream fileContent;
+    std::string line;
+    bool isInCFWListSection = false;
 
-  QByteArray CFWListUtf8 = List.toUtf8();
+    // 读取现有文件内容
+    while (std::getline(infile, line)) {
+        fileContent << line << "\n";
+        // 如果遇到 [CFWList] 部分，标记为开始位置
+        if (line == "[CFWList(" + Name.toStdString() +")]") {
+            isInCFWListSection = true;
+        }
+        // 如果已经在 [LastConnectedDevice] 部分，直到遇到空行或另一个部分则跳出
+        if (isInCFWListSection && line.empty()) {
+            isInCFWListSection = false;
+        }
+    }
+    infile.close();
 
-  // 写入 QString 大小信息和数据
-  size_t CFWListSize = static_cast<size_t>(CFWListUtf8.size());
-  outfile.write(reinterpret_cast<const char *>(&CFWListSize), sizeof(size_t));
-  outfile.write(CFWListUtf8.constData(), CFWListSize);
+    // 如果文件已经包含了 [LastConnectedDevice] 部分，则移除旧的内容
+    std::string content = fileContent.str();
+    size_t pos = content.find("[CFWList(" + Name.toStdString() +")]");
+    if (pos != std::string::npos) {
+        size_t endPos = content.find("(End of CFW list)\n\n", pos) + std::string("(End of CFW list)\n\n").length();  
+        if (endPos != std::string::npos) {
+            content.erase(pos, endPos - pos);  // 删除旧的设备列表部分
+        }
+    }
 
-  outfile.close();
+    // 打开文件进行写入（覆盖模式）
+    std::ofstream outfile(filename, std::ios::out | std::ios::trunc);  // 打开文件以覆盖内容
+    if (!outfile.is_open()) {
+        Logger::Log("saveCFWList | An error occurred while opening the configuration file for writing: " + filename, LogLevel::ERROR, DeviceType::MAIN);
+        return;
+    }
+
+    // 先写入文件的原始内容（去掉 [LastConnectedDevice] 部分）
+    outfile << content;
+
+    // 写入新的 [LastConnectedDevice] 部分
+    outfile << "[CFWList(" + Name.toStdString() +")]\n";
+
+    QByteArray CFWListUtf8 = List.toUtf8();
+
+    // 将 QString 转换为 UTF-8 格式的字符串，并保存
+    outfile << "CFWList=" << CFWListUtf8.constData() << "\n";
+
+    outfile << "(End of CFW list)\n\n";
+
+    outfile.close();
 }
 
 QString Tools::readCFWList(QString Name)
 {
-  std::string directory = "config";                      // 配置文件夹名
-  std::string filename = directory + "/CFWList(" + Name.toStdString() +").dat";  // 在配置文件夹中创建文件
-  std::ifstream infile(filename, std::ios::binary);
+    QString CFWList;
+    std::string filename = "config/config.ini"; // INI 配置文件路径
+    std::ifstream infile(filename);
+
+    if (!infile.is_open()) {
+        Logger::Log("readCFWList | Error occurred while opening file for reading: " + filename, LogLevel::ERROR, DeviceType::MAIN);
+        return QString();
+    }
+
+    std::string line;
+    bool inCFWListSection = false;
+    SystemDevice currentDevice;
+    std::map<std::string, std::string> sectionData;
+
+    // 逐行读取 INI 文件
+    while (std::getline(infile, line)) {
+        // 检查是否进入了 [LastConnectedDevice] 部分
+        if (line.find("[CFWList(" + Name.toStdString() +")]") != std::string::npos) {
+            inCFWListSection = true;
+            continue; // 跳过这一行，开始读取数据
+        }
+
+        if (inCFWListSection) {
+            // 遇到下一个部分或空行，停止读取当前部分
+            if (line.empty() || line[0] == '[') {
+                // 这里保存当前设备并重置
+                if (!sectionData.empty()) {
+                    // 用 sectionData 填充当前设备
+                    CFWList = QString::fromStdString(sectionData["CFWList"]);
+                }
+                // 重置
+                sectionData.clear();
+
+                if (!line.empty() && line[0] == '[') {
+                    // 如果遇到新的节，跳出循环
+                    break;
+                }
+            } else {
+                // 解析键值对
+                std::string key, value;
+                std::istringstream lineStream(line);
+                if (std::getline(std::getline(lineStream, key, '='), value)) {
+                    sectionData[key] = value;
+                }
+            }
+        }
+    }
+
+    infile.close();
+    return CFWList;
+}
+
+void Tools::saveDSLRsInfo(DSLRsInfo DSLRsInfo)
+{
+  std::string directory = "config";                 // 配置文件夹名
+  std::string filename = directory + "/config.ini"; // 配置文件路径
+
+  // 检查文件夹是否存在，如果不存在就创建
+  if (!std::filesystem::exists(directory))
+  {
+    if (!std::filesystem::create_directory(directory))
+    {
+      Logger::Log("saveDSLRsInfo | An error occurred while creating the configuration folder: " + directory, LogLevel::ERROR, DeviceType::MAIN);
+      return;
+    }
+  }
+
+  // 读取现有配置文件的内容
+  std::ifstream infile(filename);
+  std::stringstream fileContent;
+  std::string line;
+  bool isInDSLRsInfoSection = false;
+
+  // 读取现有文件内容
+  while (std::getline(infile, line))
+  {
+    fileContent << line << "\n";
+    // 如果遇到 [DSLRsInfo] 部分，标记为开始位置
+    if (line == "[DSLRsInfo(" + DSLRsInfo.Name.toStdString() + ")]")
+    {
+      isInDSLRsInfoSection = true;
+    }
+    // 如果已经在 [DSLRsInfo] 部分，直到遇到空行或另一个部分则跳出
+    if (isInDSLRsInfoSection && line.empty())
+    {
+      isInDSLRsInfoSection = false;
+    }
+  }
+  infile.close();
+
+  // 如果文件已经包含了 [DSLRsInfo] 部分，则移除旧的内容
+  std::string content = fileContent.str();
+  size_t pos = content.find("[DSLRsInfo(" + DSLRsInfo.Name.toStdString() + ")]");
+  if (pos != std::string::npos)
+  {
+    size_t endPos = content.find("(End of DSLR Info)\n\n", pos) + std::string("(End of DSLR Info)\n\n").length();
+    if (endPos != std::string::npos)
+    {
+      content.erase(pos, endPos - pos); // 删除旧的设备列表部分
+    }
+  }
+
+  // 打开文件进行写入（覆盖模式）
+  std::ofstream outfile(filename, std::ios::out | std::ios::trunc); // 打开文件以覆盖内容
+  if (!outfile.is_open())
+  {
+    Logger::Log("saveDSLRsInfo | An error occurred while opening the configuration file for writing: " + filename, LogLevel::ERROR, DeviceType::MAIN);
+    return;
+  }
+
+  // 先写入文件的原始内容（去掉 [DSLRsInfo] 部分）
+  outfile << content;
+
+  // 写入新的 [DSLRsInfo] 部分
+  outfile << "[DSLRsInfo(" + DSLRsInfo.Name.toStdString() + ")]\n";
+
+  // 将 QString 转换为 UTF-8 格式的字符串，并保存
+  outfile << "DSLRsSizeX=" << DSLRsInfo.SizeX << "\n";
+  outfile << "DSLRsSizeY=" << DSLRsInfo.SizeY << "\n";
+  outfile << "DSLRsPixelSize=" << DSLRsInfo.PixelSize << "\n";
+
+  outfile << "(End of DSLR Info)\n\n";
+
+  outfile.close();
+}
+DSLRsInfo Tools::readDSLRsInfo(QString Name)
+{
+  DSLRsInfo DSLRsInfo;
+  DSLRsInfo.Name = "";
+  std::string filename = "config/config.ini"; // INI 配置文件路径
+  std::ifstream infile(filename);
 
   if (!infile.is_open())
   {
-    std::cerr << "打开文件读取时发生错误: " << filename << std::endl;
-    return QString();
+    Logger::Log("readDSLRsInfo | Error occurred while opening file for reading: " + filename, LogLevel::ERROR, DeviceType::MAIN);
+    return DSLRsInfo;
   }
 
-  // 读取经验时间列表的大小
-  size_t CFWListSize;
-  infile.read(reinterpret_cast<char *>(&CFWListSize), sizeof(size_t));
+  std::string line;
+  bool inDSLRsInfoSection = false;
+  std::map<std::string, std::string> sectionData;
 
-  // 分配内存空间用于存储经验时间列表的数据
-  char *buffer = new char[CFWListSize];
+  // 逐行读取 INI 文件
+  while (std::getline(infile, line))
+  {
+    // 检查是否进入了 [DSLRsInfo] 部分
+    if (line.find("[DSLRsInfo(" + Name.toStdString() + ")]") != std::string::npos)
+    {
+      inDSLRsInfoSection = true;
+      DSLRsInfo.Name = Name;
+      continue; // 跳过这一行，开始读取数据
+    }
 
-  // 读取经验时间列表的数据
-  infile.read(buffer, CFWListSize);
+    if (inDSLRsInfoSection)
+    {
+      // 遇到下一个部分或空行，停止读取当前部分
+      if (line.empty() || line[0] == '[')
+      {
+        // 这里保存当前设备并重置
+        if (!sectionData.empty())
+        {
+          // 用 sectionData 填充当前设备
+          DSLRsInfo.SizeX = sectionData.count("DSLRsSizeX") ? QString::fromStdString(sectionData["DSLRsSizeX"]).toInt() : 0;
+          DSLRsInfo.SizeY = sectionData.count("DSLRsSizeY") ? QString::fromStdString(sectionData["DSLRsSizeY"]).toInt() : 0;
+          DSLRsInfo.PixelSize = sectionData.count("DSLRsPixelSize") ? QString::fromStdString(sectionData["DSLRsPixelSize"]).toDouble() : 0.0;
+        }
+        // 重置
+        sectionData.clear();
 
-  // 将读取的数据转换为 QString
-  QString CFWList = QString::fromUtf8(buffer, CFWListSize);
+        if (!line.empty() && line[0] == '[')
+        {
+          // 如果遇到新的节，跳出循环
+          break;
+        }
+      }
+      else
+      {
+        // 解析键值对
+        std::string key, value;
+        std::istringstream lineStream(line);
+        if (std::getline(std::getline(lineStream, key, '='), value))
+        {
+          sectionData[key] = value;
+        }
+      }
+    }
+  }
 
-  // 释放内存空间
-  delete[] buffer;
-
-  // 关闭文件
   infile.close();
+  return DSLRsInfo;
+}
 
-  return CFWList;
+void Tools::readClientSettings(const std::string& fileName, std::unordered_map<std::string, std::string>& config) {
+    std::ifstream file(fileName);
+    if (!file.is_open()) {
+        Logger::Log("readClientSettings | Error occurred while opening file for reading: " + fileName, LogLevel::ERROR, DeviceType::MAIN);
+        return;
+    }
+
+    std::string line;
+    std::string currentSection;
+
+    while (std::getline(file, line)) {
+        // 去除空白字符
+        line.erase(0, line.find_first_not_of(" \t\n\r"));
+        line.erase(line.find_last_not_of(" \t\n\r") + 1);
+
+        if (line.empty()) continue;  // 跳过空行
+
+        // 处理区块头，找到[ClientSettings]等部分
+        if (line[0] == '[' && line[line.length() - 1] == ']') {
+            currentSection = line.substr(1, line.length() - 2);
+            continue;
+        }
+
+        // 处理[ClientSettings]中的内容
+        if (currentSection == "ClientSettings") {
+            size_t pos = line.find("=");
+            if (pos != std::string::npos) {
+                std::string key = line.substr(0, pos);
+                std::string value = line.substr(pos + 1);
+                // 去除多余的空格
+                key.erase(0, key.find_first_not_of(" \t"));
+                key.erase(key.find_last_not_of(" \t") + 1);
+                value.erase(0, value.find_first_not_of(" \t"));
+                value.erase(value.find_last_not_of(" \t") + 1);
+                config[key] = value;
+            }
+        }
+    }
+
+    file.close();
+}
+
+void Tools::saveClientSettings(const std::string& fileName, const std::unordered_map<std::string, std::string>& config) {
+  // 读取文件内容
+  std::ifstream inputFile(fileName);
+  std::stringstream fileContents;
+  fileContents << inputFile.rdbuf();
+  inputFile.close();
+
+  std::string content = fileContents.str();
+  // 确保文件末尾有换行，避免追加时粘连
+  if (!content.empty() && content.back() != '\n') content.push_back('\n');
+
+  const std::string sectionHeader = "[ClientSettings]";
+  // 兼容查找：允许后面有或没有换行
+  size_t sectionPos = content.find(sectionHeader);
+
+  if (sectionPos == std::string::npos)
+  {
+    // 如果没有找到 [ClientSettings] 部分，则添加段头并写入全部键值
+    content += "\n" + sectionHeader + "\n";
+    for (const auto &pair : config)
+    {
+      content += pair.first + " = " + pair.second + "\n";
+      Logger::Log("addClientSettings | " + pair.first + " = " + pair.second, LogLevel::INFO, DeviceType::MAIN);
+    }
+  }
+  else
+  {
+    // 找到 [ClientSettings] 部分后，定位到此部分结束的位置
+    // 跳过段头本行
+    size_t headerLineEnd = content.find('\n', sectionPos);
+    if (headerLineEnd == std::string::npos) headerLineEnd = content.size();
+    size_t sectionEnd = content.find("\n[", headerLineEnd);
+    if (sectionEnd == std::string::npos)
+    {
+      sectionEnd = content.size();
+    }
+
+    // 进入 [ClientSettings] 部分并将配置项读取到内存中
+    std::string clientSettingsSection = content.substr(sectionPos, sectionEnd - sectionPos);
+
+    // 更新配置项
+    for (const auto &pair : config)
+    {
+      // 查找是否已有该配置项
+      size_t pos = clientSettingsSection.find(pair.first + " = ");
+      if (pos != std::string::npos)
+      {
+        // 找到了该项，更新其值
+        size_t endPos = clientSettingsSection.find('\n', pos);
+        if (endPos == std::string::npos) endPos = clientSettingsSection.size();
+        clientSettingsSection.replace(pos + pair.first.size() + 3, endPos - pos - pair.first.size() - 3, pair.second);
+        Logger::Log("updateClientSettings | " + pair.first + " = " + pair.second, LogLevel::INFO, DeviceType::MAIN);
+      }
+      else
+      {
+        // 没有找到该项，添加新的配置项
+        if (!clientSettingsSection.empty() && clientSettingsSection.back() != '\n') clientSettingsSection.push_back('\n');
+        clientSettingsSection += pair.first + " = " + pair.second + "\n";
+        Logger::Log("addClientSettings | " + pair.first + " = " + pair.second, LogLevel::INFO, DeviceType::MAIN);
+      }
+    }
+
+    // 替换原来的部分
+    content.replace(sectionPos, sectionEnd - sectionPos, clientSettingsSection);
+  }
+
+  // 将更新后的内容写回到文件
+  std::ofstream outputFile(fileName);
+  // 最终保证文件末尾换行
+  if (!content.empty() && content.back() != '\n') content.push_back('\n');
+  outputFile << content;
+  outputFile.close();
 }
 
 void Tools::clearSystemDeviceListItem(SystemDeviceList &s,int index){
     //clear one device
-    qDebug()<<"index:"<<index;
+    Logger::Log("clearSystemDeviceListItem | index:" + std::to_string(index), LogLevel::INFO, DeviceType::MAIN);
     if (s.system_devices.empty()) {
-        qDebug()<<"s.system_devices is nullptr";
+        Logger::Log("clearSystemDeviceListItem | s.system_devices is nullptr", LogLevel::INFO, DeviceType::MAIN);
     }
     else {
         s.system_devices[index].Description="";
@@ -719,17 +1488,18 @@ void Tools::clearSystemDeviceListItem(SystemDeviceList &s,int index){
         s.system_devices[index].DriverFrom="";
         s.system_devices[index].DriverIndiName="";
         s.system_devices[index].isConnect=false;
-        qDebug()<<"clearSystemDeviceListItem";
+        Logger::Log("clearSystemDeviceListItem | SystemDeviceListItem already cleared.", LogLevel::INFO, DeviceType::MAIN);
     }
 }
 
 void Tools::initSystemDeviceList(SystemDeviceList &s){
+    s.system_devices.clear();
     s.system_devices.reserve(32); //pre-define 32 devices
     SystemDevice dev;
     dev.DeviceIndiName="";
     dev.DeviceIndiGroup=-1;
     dev.DeviceIndiName="";
-    dev.DriverFrom="";      //DriverFrom 用于存储驱动类型。如果来自于INDI，则是“INDI"  如果来自于QHYCCD SDK  则是”QHYCCDSDK"
+    dev.DriverFrom="";      //DriverFrom 用于存储驱动类型。如果来自于INDI，则是"INDI"  如果来自于QHYCCD SDK  则是"QHYCCDSDK"
     dev.isConnect=false;
     dev.dp=NULL;
 
@@ -738,12 +1508,20 @@ void Tools::initSystemDeviceList(SystemDeviceList &s){
     }
 }
 
-int Tools::getTotalDeviceFromSystemDeviceList(SystemDeviceList s){
+int Tools::getTotalDeviceFromSystemDeviceList(const SystemDeviceList& s){
     //according the deviceIndiName to get how many devices in systemDeviceList
     //This
     int i=0;
-    for(auto dev:s.system_devices){
+    for(const auto& dev : s.system_devices){
         if(dev.DeviceIndiName !="") i++;
+    }
+    return i;
+}
+
+int Tools::getDriverNumFromSystemDeviceList(const SystemDeviceList& s){
+    int i=0;
+    for(const auto& dev : s.system_devices){
+        if(dev.DriverIndiName !="") i++;
     }
     return i;
 }
@@ -755,9 +1533,9 @@ void Tools::cleanSystemDeviceListConnect(SystemDeviceList &s){
     }
 }
 
-uint32_t Tools::getIndexFromSystemDeviceList(SystemDeviceList s,QString devname,int &index){
+uint32_t Tools::getIndexFromSystemDeviceListByName(const SystemDeviceList& s,QString devname,int &index){
     int i=0;
-    for(auto dev:s.system_devices){
+    for(const auto& dev : s.system_devices){
         if (dev.DeviceIndiName == devname ){
             index = i;
             break;
@@ -766,15 +1544,14 @@ uint32_t Tools::getIndexFromSystemDeviceList(SystemDeviceList s,QString devname,
     }
     if(i<32) {
         index=i;
-        qDebug()<<"getIndexFromSystemDeviceList | found device in system list. device name" << devname<< "index" <<index;
+        Logger::Log("getIndexFromSystemDeviceListByName | found device in system list. device name" + devname.toStdString() + "index" + std::to_string(index), LogLevel::INFO, DeviceType::MAIN);
         return QHYCCD_SUCCESS;
     }
     else{
         index=0;
-        qDebug()<<"getIndexFromSystemDeviceList | not found device in system list, devname"<<devname;
+        Logger::Log("getIndexFromSystemDeviceListByName | not found device in system list, devname" + devname.toStdString(), LogLevel::INFO, DeviceType::MAIN);
         return QHYCCD_ERROR;
     }
-
 }
 
 void Tools::startIndiDriver(QString driver_name)
@@ -787,7 +1564,7 @@ void Tools::startIndiDriver(QString driver_name)
     s.append("> /tmp/myFIFO");
     system(s.toUtf8().constData());
     // qDebug() << "startIndiDriver" << driver_name;
-    qDebug() << "Start INDI Driver | DriverName: " << driver_name;
+    Logger::Log("startIndiDriver | Start Connecting INDI Driver : " + driver_name.toStdString(), LogLevel::INFO, DeviceType::MAIN);
 }
 
 void Tools::stopIndiDriver(QString driver_name)
@@ -811,7 +1588,7 @@ void Tools::stopIndiDriverAll(const DriversList driver_list)
     indiserver = true;
     if (!indiserver)
     {
-        qDebug("stopIndiDriverAll | ERROR | INDI DRIVER NOT running");
+        Logger::Log("stopIndiDriverAll | ERROR | INDI DRIVER NOT running", LogLevel::ERROR, DeviceType::MAIN);
         return;
     }
 
@@ -873,47 +1650,81 @@ uint32_t Tools::readFitsHeadForDevName(std::string filename, QString &devname)
 }
 
 int Tools::readFits(const char* fileName, cv::Mat& image) {
-//currently it can only handle the 8bit and 16bit RAW image
-//does not support 32bit RAW image, 8bit and 16bit RGB image
-  fitsfile* fptr;
-  int status = 0;
-  int bitpix, naxis;
-  long naxes[2];
-  long nelements;
-  unsigned short* array;
+    fitsfile* fptr;
+    int status = 0;
+    int bitpix, naxis;
+    long naxes[2];
+    long nelements;
+    void* array = nullptr;
 
-  // 打开 FITS 文件
-  if (fits_open_file(&fptr, fileName, READONLY, &status)) {
+    // 打开 FITS 文件
+    if (fits_open_file(&fptr, fileName, READONLY, &status)) {
+        return status;
+    }
+
+    // 读取图像信息
+    if (fits_get_img_param(fptr, 2, &bitpix, &naxis, naxes, &status)) {
+        fits_close_file(fptr, &status);
+        return status;
+    }
+
+    // 确保图像是二维的且尺寸有效
+    if (naxis != 2 || naxes[0] <= 0 || naxes[1] <= 0) {
+        fits_close_file(fptr, &status);
+        return -1; // 无效图像维度或尺寸
+    }
+
+    // 动态分配内存并读取数据
+    nelements = naxes[0] * naxes[1];
+    if (bitpix == 8) {
+        array = new uint8_t[nelements];
+        if (fits_read_img(fptr, TBYTE, 1, nelements, NULL, array, NULL, &status)) {
+            delete[] static_cast<uint8_t*>(array);
+            fits_close_file(fptr, &status);
+            return status;
+        }
+        image = cv::Mat(naxes[1], naxes[0], CV_8U, array).clone(); // 深拷贝
+        delete[] static_cast<uint8_t*>(array); // 释放原数组
+    } else if (bitpix == 16) {
+        array = new uint16_t[nelements];
+        if (fits_read_img(fptr, TUSHORT, 1, nelements, NULL, array, NULL, &status)) {
+            delete[] static_cast<uint16_t*>(array);
+            fits_close_file(fptr, &status);
+            return status;
+        }
+        image = cv::Mat(naxes[1], naxes[0], CV_16U, array).clone(); // 深拷贝
+        delete[] static_cast<uint16_t*>(array); // 释放原数组
+    } else {
+        fits_close_file(fptr, &status);
+        return -2; // 不支持的位深度
+    }
+
+    // 关闭文件
+    fits_close_file(fptr, &status);
     return status;
-  }
+}
 
-  // 读取图像信息
-  if (fits_get_img_param(fptr, 2, &bitpix, &naxis, naxes, &status)) {
-    return status;
-  }
+QString Tools::getFitsCaptureTime(const char* fileName) {
+    fitsfile* fptr;
+    int status = 0;
+    char dateObs[30]; // 用于存储拍摄时间字符串
 
-  // 确保图像是二维的
-  if (naxis != 2) {
-    return -1;
-  }
+    // 打开 FITS 文件
+    if (fits_open_file(&fptr, fileName, READONLY, &status)) {
+        return QString(); // 返回空 QString 以表示错误
+    }
 
-  // 读取图像数据
-  nelements = naxes[0] * naxes[1];
-  array = new unsigned short[nelements];
-  if (fits_read_img(fptr, TUSHORT, 1, nelements, NULL, array, NULL, &status)) {
-    delete[] array;
-    return status;
-  }
+    // 获取拍摄时间
+    if (fits_read_key(fptr, TSTRING, "DATE-OBS", dateObs, NULL, &status)) {
+        fits_close_file(fptr, &status);
+        return QString(); // 返回空 QString 以表示错误
+    }
 
-  // 将数据转换为 cv::Mat
-  if(bitpix==16)      image = cv::Mat(naxes[1], naxes[0], CV_16U, array).clone();
-  else if(bitpix==8)  image = cv::Mat(naxes[1], naxes[0], CV_8U, array).clone();
-
-  // 释放内存并关闭文件
-  delete[] array;
-  fits_close_file(fptr, &status);
-
-  return status;
+    // 关闭文件
+    fits_close_file(fptr, &status);
+    
+    // 返回 QString 类型的拍摄时间
+    return QString::fromStdString(dateObs);
 }
 
 int Tools::readFits_(const char* fileName, cv::Mat& image) {
@@ -958,14 +1769,14 @@ void Tools::ConnectQHYCCDSDK() {
   uint16_t index, value;
   ret = InitQHYCCDResource();
   // EnableQHYCCDMessage(true);
-  qDebug("initqhyccdresosurce %d", ret);
+  Logger::Log("initqhyccdresosurce " + std::to_string(ret), LogLevel::INFO, DeviceType::MAIN);
   uint32_t devices = 0;
 
   devices = ScanQHYCCD();
-  qDebug("found qhyccd device %d", devices);
+  Logger::Log("found qhyccd device " + std::to_string(devices), LogLevel::INFO, DeviceType::MAIN);
 
   if (devices < 1) {
-    qDebug() << "SelectQHYCCDSDKDevice | No QHYCCD SDK Device Found";
+    Logger::Log("SelectQHYCCDSDKDevice | No QHYCCD SDK Device Found", LogLevel::INFO, DeviceType::MAIN);
     return;
   }
 
@@ -984,14 +1795,14 @@ void Tools::ConnectQHYCCDSDK() {
 
     if (strcmp(cameraName, "QHY5III485") == 0) {
       fpgahandle_ = OpenQHYCCD(camid_);
-      qDebug("Found FPGA device:%d", fpgahandle_);
+      Logger::Log("Found FPGA device:" + std::to_string(reinterpret_cast<uintptr_t>(fpgahandle_)), LogLevel::INFO, DeviceType::MAIN);
     } else if (strcmp(cameraName, "QHY5III178") == 0) {
       guiderhandle_ = OpenQHYCCD(camid_);
-      qDebug("Found guider device:%d", guiderhandle_);
+      Logger::Log("Found guider device:" + std::to_string(reinterpret_cast<uintptr_t>(guiderhandle_)), LogLevel::INFO, DeviceType::MAIN);
     } else if (strcmp(cameraName, "POLEMASTER") == 0) {
       // polerhandle_ = OpenQHYCCD(camid_);
       guiderhandle_ = OpenQHYCCD(camid_);
-      qDebug("Found poler device:%d", polerhandle_);
+      Logger::Log("Found poler device:" + std::to_string(reinterpret_cast<uintptr_t>(guiderhandle_)), LogLevel::INFO, DeviceType::MAIN);
     }
   }
 }
@@ -1001,39 +1812,37 @@ void Tools::ScanCamera() {
     int ret;
     camhandle_ = OpenQHYCCD(camid_);
     if (camhandle_ != NULL) {
-      qDebug("Open QHYCCD success.\n");
+      Logger::Log("Open QHYCCD success.\n", LogLevel::INFO, DeviceType::MAIN);
     } else {
-      qDebug("Open QHYCCD failure.\n");
+      Logger::Log("Open QHYCCD failure.\n", LogLevel::INFO, DeviceType::MAIN);
     }
 
     ret = IsQHYCCDControlAvailable(camhandle_, CAM_SINGLEFRAMEMODE);
     if (QHYCCD_ERROR == ret) {
-      qDebug("The detected camera is not support single frame.");
+      Logger::Log("The detected camera is not support single frame.", LogLevel::INFO, DeviceType::MAIN);
       // release sdk resources
       ret = ReleaseQHYCCDResource();
       if (QHYCCD_SUCCESS == ret) {
-        qDebug("SDK resources released.");
+        Logger::Log("SDK resources released.", LogLevel::INFO, DeviceType::MAIN);
       } else {
-        qDebug() << "Cannot release SDK resources, error:" << ret;
+        Logger::Log("Cannot release SDK resources, error:" + std::to_string(ret), LogLevel::INFO, DeviceType::MAIN);
       }
     }
 
     int mode = 0;
     ret = SetQHYCCDStreamMode(camhandle_, mode);
     if (QHYCCD_SUCCESS == ret) {
-      qDebug() << "SetQHYCCDStreamMode set to:" << mode << "success.";
+      Logger::Log("SetQHYCCDStreamMode set to:" + std::to_string(mode) + "success.", LogLevel::INFO, DeviceType::MAIN);
     } else {
-      qDebug() << "SetQHYCCDStreamMode:" << mode << "failure, error:" << ret;
+      Logger::Log("SetQHYCCDStreamMode:" + std::to_string(mode) + "failure, error:" + std::to_string(ret), LogLevel::INFO, DeviceType::MAIN);
     }
-    qDebug() << "\033[0m\033[1;35m"
-             << "initialize camera"
-             << "\033[0m";
+    Logger::Log("\033[0m\033[1;35minitialize camera\033[0m", LogLevel::INFO, DeviceType::MAIN);
     // initialize camera
     ret = InitQHYCCD(camhandle_);
     if (QHYCCD_SUCCESS == ret) {
-      qDebug("InitQHYCCD success.");
+      Logger::Log("InitQHYCCD success.", LogLevel::INFO, DeviceType::MAIN);
     } else {
-      qDebug() << "InitQHYCCD faililure, error:" << ret;
+      Logger::Log("InitQHYCCD faililure, error:" + std::to_string(ret), LogLevel::INFO, DeviceType::MAIN);
     }
   }
   if ((Tools::systemDeviceList().currentDeviceCode >= 0) &&
@@ -1050,7 +1859,6 @@ void Tools::SelectQHYCCDSDKDevice(int systemNumber) {
   // QHYCCDSDK has no Groupd define.
   Tools::driversList().selectedGrounp = -1;
 }
-
 cv::Mat Tools::Capture() {
   double expTime_sec;
   expTime_sec = (double)glMainCameraExpTime_ / 1000 / 1000;
@@ -1093,26 +1901,26 @@ cv::Mat Tools::Capture() {
   ret = GetQHYCCDOverScanArea(camhandle_, &overscanStartX, &overscanStartY,
                               &overscanSizeX, &overscanSizeY);
   if (QHYCCD_SUCCESS == ret) {
-    qDebug() << "GetQHYCCDOverScanArea success";
+    Logger::Log("GetQHYCCDOverScanArea success", LogLevel::INFO, DeviceType::MAIN);
   } else {
-    qDebug() << "GetQHYCCDOverScanArea error";
+    Logger::Log("GetQHYCCDOverScanArea error", LogLevel::INFO, DeviceType::MAIN);
     return {};
   }
   ret = GetQHYCCDOverScanArea(camhandle_, &effectiveStartX, &effectiveStartY,
                               &effectiveSizeX, &effectiveSizeY);
   if (QHYCCD_SUCCESS == ret) {
-    qDebug() << "GetQHYCCDEffectiveArea success";
+    Logger::Log("GetQHYCCDEffectiveArea success", LogLevel::INFO, DeviceType::MAIN);
   } else {
-    qDebug() << "GetQHYCCDEffectiveArea error";
+    Logger::Log("GetQHYCCDEffectiveArea error", LogLevel::INFO, DeviceType::MAIN);
     return {};
   }
   ret =
       GetQHYCCDChipInfo(camhandle_, &chipWidthMM, &chipHeightMM, &maxImageSizeX,
                         &maxImageSizeY, &pixelWidthUM, &pixelHeightUM, &bpp);
   if (QHYCCD_SUCCESS == ret) {
-    qDebug() << "GetQHYCCDChipInfo success";
+    Logger::Log("GetQHYCCDChipInfo success", LogLevel::INFO, DeviceType::MAIN);
   } else {
-    qDebug() << "GetQHYCCDChipInfo error";
+    Logger::Log("GetQHYCCDChipInfo error", LogLevel::INFO, DeviceType::MAIN);
     return {};
   }
 
@@ -1124,22 +1932,22 @@ cv::Mat Tools::Capture() {
   ret = IsQHYCCDControlAvailable(camhandle_, CAM_COLOR);
   if (ret == BAYER_GB || ret == BAYER_GR || ret == BAYER_BG ||
       ret == BAYER_RG) {
-    qDebug() << "This is a color camera.";
-    qDebug() << "even this is a color camera, in Single Frame mode THE SDK "
+    Logger::Log("This is a color camera.", LogLevel::INFO, DeviceType::MAIN);
+    Logger::Log("even this is a color camera, in Single Frame mode THE SDK "
                 "ONLY SUPPORT RAW OUTPUT.So please do not set "
-                "SetQHYCCDDebayerOnOff() to true;";
+                "SetQHYCCDDebayerOnOff() to true;", LogLevel::INFO, DeviceType::MAIN);
   } else {
-    qDebug() << "This is a mono camera.";
+    Logger::Log("This is a mono camera.", LogLevel::INFO, DeviceType::MAIN);
   }
 
   ret = IsQHYCCDControlAvailable(camhandle_, CONTROL_USBTRAFFIC);
   if (QHYCCD_SUCCESS == ret) {
     ret = SetQHYCCDParam(camhandle_, CONTROL_USBTRAFFIC, USB_TRAFFIC);
     if (QHYCCD_SUCCESS == ret) {
-      qDebug() << "SetQHYCCDParam CONTROL_USBTRAFFIC set to:" << USB_TRAFFIC
-               << "success.";
+      Logger::Log("SetQHYCCDParam CONTROL_USBTRAFFIC set to:" + std::to_string(USB_TRAFFIC)
+               + "success.", LogLevel::INFO, DeviceType::MAIN);
     } else {
-      qDebug() << "SetQHYCCDParam CONTROL_USBTRAFFIC error";
+      Logger::Log("SetQHYCCDParam CONTROL_USBTRAFFIC error", LogLevel::INFO, DeviceType::MAIN);
       getchar();
       return {};
     }
@@ -1149,10 +1957,10 @@ cv::Mat Tools::Capture() {
   if (QHYCCD_SUCCESS == ret) {
     ret = SetQHYCCDParam(camhandle_, CONTROL_GAIN, CHIP_GAIN);
     if (QHYCCD_SUCCESS == ret) {
-      qDebug() << "SetQHYCCDParam CONTROL_GAIN set to:" << CHIP_GAIN
-               << "success.";
+      Logger::Log("SetQHYCCDParam CONTROL_GAIN set to:" + std::to_string(CHIP_GAIN)
+               + "success.", LogLevel::INFO, DeviceType::MAIN);
     } else {
-      qDebug() << "SetQHYCCDParam CONTROL_GAIN error";
+      Logger::Log("SetQHYCCDParam CONTROL_GAIN error", LogLevel::INFO, DeviceType::MAIN);
       getchar();
       return {};
     }
@@ -1162,10 +1970,10 @@ cv::Mat Tools::Capture() {
   if (QHYCCD_SUCCESS == ret) {
     ret = SetQHYCCDParam(camhandle_, CONTROL_OFFSET, CHIP_OFFSET);
     if (QHYCCD_SUCCESS == ret) {
-      qDebug() << "SetQHYCCDParam CONTROL_OFFSET set to:" << CHIP_OFFSET
-               << "success.";
+      Logger::Log("SetQHYCCDParam CONTROL_OFFSET set to:" + std::to_string(CHIP_OFFSET)
+               + "success.", LogLevel::INFO, DeviceType::MAIN);
     } else {
-      qDebug() << "SetQHYCCDParam CONTROL_OFFSET failed.";
+      Logger::Log("SetQHYCCDParam CONTROL_OFFSET failed.", LogLevel::INFO, DeviceType::MAIN);
       getchar();
       return {};
     }
@@ -1173,10 +1981,10 @@ cv::Mat Tools::Capture() {
 
   ret = SetQHYCCDParam(camhandle_, CONTROL_EXPOSURE, EXPOSURE_TIME);
   if (QHYCCD_SUCCESS == ret) {
-    qDebug() << "SetQHYCCDParam CONTROL_EXPOSURE set to:" << EXPOSURE_TIME
-             << "success.";
+    Logger::Log("SetQHYCCDParam CONTROL_EXPOSURE set to:" + std::to_string(EXPOSURE_TIME)
+             + "success.", LogLevel::INFO, DeviceType::MAIN);
   } else {
-    qDebug() << "SetQHYCCDParam CONTROL_EXPOSURE failure";
+    Logger::Log("SetQHYCCDParam CONTROL_EXPOSURE failure", LogLevel::INFO, DeviceType::MAIN);
     getchar();
     return {};
   }
@@ -1184,17 +1992,17 @@ cv::Mat Tools::Capture() {
   ret =
       SetQHYCCDResolution(camhandle_, roiStartX, roiStartY, roiSizeX, roiSizeY);
   if (QHYCCD_SUCCESS == ret) {
-    qDebug() << "SetQHYCCDResolution success.";
+    Logger::Log("SetQHYCCDResolution success.", LogLevel::INFO, DeviceType::MAIN);
   } else {
-    qDebug() << "SetQHYCCDResolution error.";
+    Logger::Log("SetQHYCCDResolution error.", LogLevel::INFO, DeviceType::MAIN);
     return {};
   }
 
   ret = SetQHYCCDBinMode(camhandle_, camBinX, camBinY);
   if (QHYCCD_SUCCESS == ret) {
-    qDebug() << "SetQHYCCDBinMode success.";
+    Logger::Log("SetQHYCCDBinMode success.", LogLevel::INFO, DeviceType::MAIN);
   } else {
-    qDebug() << "SetQHYCCDBinMode error.";
+    Logger::Log("SetQHYCCDBinMode error.", LogLevel::INFO, DeviceType::MAIN);
     return {};
   }
 
@@ -1202,19 +2010,19 @@ cv::Mat Tools::Capture() {
   if (QHYCCD_SUCCESS == ret) {
     ret = SetQHYCCDBitsMode(camhandle_, 16);
     if (QHYCCD_SUCCESS == ret) {
-      qDebug() << "SetQHYCCDBitsMode success.";
+      Logger::Log("SetQHYCCDBitsMode success.", LogLevel::INFO, DeviceType::MAIN);
     } else {
-      qDebug() << "SetQHYCCDBitsMode error.";
+      Logger::Log("SetQHYCCDBitsMode error", LogLevel::INFO, DeviceType::MAIN);
       getchar();
       return {};
     }
   }
 
-  qDebug() << "ExpQHYCCDSingleFrame(camhandle) - start...";
+  Logger::Log("ExpQHYCCDSingleFrame(camhandle) - start...", LogLevel::INFO, DeviceType::MAIN);
   ret = ExpQHYCCDSingleFrame(camhandle_);
-  qDebug() << "ExpQHYCCDSingleFrame(camhandle) - end...";
+  Logger::Log("ExpQHYCCDSingleFrame(camhandle) - end...", LogLevel::INFO, DeviceType::MAIN);
   if (QHYCCD_ERROR != ret) {
-    qDebug() << "ExpQHYCCDSingleFrame success.";
+    Logger::Log("ExpQHYCCDSingleFrame success.", LogLevel::INFO, DeviceType::MAIN);
     if (QHYCCD_READ_DIRECTLY != ret) {
       QElapsedTimer t;
       t.start();
@@ -1224,7 +2032,7 @@ cv::Mat Tools::Capture() {
       qDebug() << t.elapsed();
     }
   } else {
-    qDebug() << "ExpQHYCCDSingleFrame failure, error";
+    Logger::Log("ExpQHYCCDSingleFrame failure, error", LogLevel::INFO, DeviceType::MAIN);
   }
 
   uint32_t length = GetQHYCCDMemLength(camhandle_);
@@ -1232,9 +2040,9 @@ cv::Mat Tools::Capture() {
   if (length > 0) {
     pImgData = new unsigned char[length];
     memset(pImgData, 0, length);
-    qDebug() << "Allocated memory for frame:" << length;
+    Logger::Log("Allocated memory for frame:" + std::to_string(length), LogLevel::INFO, DeviceType::MAIN);
   } else {
-    qDebug() << "Cannot allocate memory for frame.";
+    Logger::Log("Cannot allocate memory for frame.", LogLevel::INFO, DeviceType::MAIN);
     return {};
   }
 
@@ -1245,7 +2053,7 @@ cv::Mat Tools::Capture() {
   ret = GetQHYCCDSingleFrame(camhandle_, &roiSizeX, &roiSizeY, &bpp, &channels,
                              pImgData);
   if (QHYCCD_SUCCESS == ret) {
-    qDebug() << "GetQHYCCDSingleFrame success.";
+    Logger::Log("GetQHYCCDSingleFrame success.", LogLevel::INFO, DeviceType::MAIN);
     // process image here
 
     // emit signalRefreshMainPageMainCameraImage(pImgData,"MONO");
@@ -1258,13 +2066,13 @@ cv::Mat Tools::Capture() {
     cv::imwrite("/dev/shm/SDK_Capture.png", mmat, creat_quality);
     mmat = mmat.clone();
   } else {
-    qDebug() << "GetQHYCCDSingleFrame error";
+    Logger::Log("GetQHYCCDSingleFrame error", LogLevel::INFO, DeviceType::MAIN);
     return {};
   }
 
   delete[] pImgData;
 
-  qDebug() << t.elapsed();
+  Logger::Log("t.elapsed():" + std::to_string(t.elapsed()), LogLevel::INFO, DeviceType::MAIN);
 
   /*
   ret = CancelQHYCCDExposingAndReadout(camhandle_);
@@ -1298,12 +2106,12 @@ int Tools::CFW() {
 
   ret = IsQHYCCDCFWPlugged(camhandle_);  // 检查滤镜轮连接状态
   if (ret == QHYCCD_SUCCESS) {
-    qDebug("CFW is plugged.");
+    // qDebug("CFW is plugged.");
     max = GetQHYCCDParam(camhandle_,
                          CONTROL_CFWSLOTSNUM);  // 获取滤镜轮孔数
     return max;
   } else {
-    qDebug("CFW is NULL.");
+    // qDebug("CFW is NULL.");
     return 0;
   }
 }
@@ -1320,7 +2128,7 @@ void Tools::SetCFW(int cfw) {
                               CONTROL_CFWPORT);  // 获取当前位置
       // sleep(500);//延时 500ms
       QThread::msleep(500);
-      qDebug() << "current location:" << status;
+      // qDebug() << "current location:" << status;
     }
   }
 }
@@ -1471,7 +2279,7 @@ void Tools::CvDebugShow(cv::Mat img) {
 QImage Tools::ShowHistogram(const cv::Mat& image,QLabel *label) {
   // 将输入图像分成三个通道
   #ifdef ImageDebug
-  qDebug() << "showHistogram |" << image.channels();
+  Logger::Log("showHistogram |" + std::to_string(image.channels()), LogLevel::INFO, DeviceType::MAIN);
   #endif
   QElapsedTimer t;
   t.start();
@@ -1480,7 +2288,7 @@ QImage Tools::ShowHistogram(const cv::Mat& image,QLabel *label) {
 
   if (image.channels() == 3) {
     #ifdef ImageDebug
-    qDebug() << "showHistogram | Draw Histograme color";
+    Logger::Log("showHistogram | Draw Histograme color", LogLevel::INFO, DeviceType::MAIN);
     #endif
     std::vector<cv::Mat> channels;
     cv::split(image, channels);
@@ -1508,9 +2316,8 @@ QImage Tools::ShowHistogram(const cv::Mat& image,QLabel *label) {
     // for three channel.
     int min_maxval = std::min({max_b, max_g, max_r});
     #ifdef ImageDebug
-    qDebug() << "showHistogram | Draw Histograme color | min of max value in 3 "
-                "channels"
-             << min_maxval;
+    Logger::Log("showHistogram | Draw Histograme color | min of max value in 3 "
+                "channels" + std::to_string(min_maxval), LogLevel::INFO, DeviceType::MAIN);
     #endif
     // qDebug()<<min_maxval;
 
@@ -1569,7 +2376,7 @@ QImage Tools::ShowHistogram(const cv::Mat& image,QLabel *label) {
 
   } else {
     #ifdef ImageDebug
-    qDebug() << "showHistogram | Draw Histograme mono";
+    Logger::Log("showHistogram | Draw Histograme mono", LogLevel::INFO, DeviceType::MAIN);
     #endif
     // 绘制直方图
     cv::Mat hist;
@@ -1610,11 +2417,10 @@ QImage Tools::ShowHistogram(const cv::Mat& image,QLabel *label) {
     label->setScaledContents(true);
   }
   #ifdef ImageDebug
-  qDebug() << "showHistogram | used time(ms) " << t.elapsed();
+  Logger::Log("showHistogram | used time(ms) " + std::to_string(t.elapsed()), LogLevel::INFO, DeviceType::MAIN);
   #endif
   return ret;
 }
-
 void Tools::PaintHistogram(cv::Mat src,QLabel *label)
 {
     int channelCount = src.channels();
@@ -1662,7 +2468,7 @@ void Tools::PaintHistogram(cv::Mat src,QLabel *label)
         //for color image. need to use the global min_value as the same threshold for three channel.
         int min_maxval = std::min({max_b, max_g, max_r});
         #ifdef ImageDebug
-        qDebug()<<"showHistogram | Draw Histograme color | min of max value in 3 channels"<<min_maxval;
+        Logger::Log("showHistogram | Draw Histograme color | min of max value in 3 channels" + std::to_string(min_maxval), LogLevel::INFO, DeviceType::MAIN);
         #endif
         //qDebug()<<min_maxval;
 
@@ -1802,7 +2608,7 @@ void Tools::ShowCvImageOnQLabel(cv::Mat image,QLabel *label) {
     // Set the QLabel's image to the QImage
   label->setPixmap(QPixmap::fromImage(qtImage));
   #ifdef ImageDebug
-  qDebug()<<"showOpenCV_QLabel_withRotate | used time(ms) "<<t.elapsed();
+  Logger::Log("showOpenCV_QLabel_withRotate | used time(ms) " + std::to_string(t.elapsed()), LogLevel::INFO, DeviceType::MAIN);
   #endif
 }
 
@@ -1816,7 +2622,7 @@ void Tools::ShowOpenCV_QLabel_withRotate(cv::Mat img,QLabel *label,int RotateTyp
     w=img.cols;
     h=img.rows;
     #ifdef ImageDebug
-    qDebug()<<"showOpenCV_QLabel_withRotate | "<<w<<h<<img.channels()<<img.type();
+    Logger::Log("showOpenCV_QLabel_withRotate | " + std::to_string(w) + " " + std::to_string(h) + " " + std::to_string(img.channels()) + " " + std::to_string(img.type()), LogLevel::INFO, DeviceType::MAIN);
     #endif
     cv::Mat imgRGB888;
     imgRGB888.create(h,w,CV_8UC3);
@@ -1848,7 +2654,7 @@ void Tools::ShowOpenCV_QLabel_withRotate(cv::Mat img,QLabel *label,int RotateTyp
     }
     else {
       #ifdef ImageDebug
-       qDebug(" showOpenCV_QLabel_withRotate | ERROR : unsupport image type") ;
+       Logger::Log(" showOpenCV_QLabel_withRotate | ERROR : unsupport image type", LogLevel::INFO, DeviceType::MAIN);
        #endif
     }
 
@@ -1894,7 +2700,7 @@ void Tools::ShowOpenCV_QLabel_withRotate(cv::Mat img,QLabel *label,int RotateTyp
     //delete simg;
     imgRGB888.release();
   #ifdef ImageDebug
-    qDebug()<<"showOpenCV_QLabel_withRotate | used time(ms) "<<t.elapsed();
+    Logger::Log("showOpenCV_QLabel_withRotate | used time(ms) " + std::to_string(t.elapsed()), LogLevel::INFO, DeviceType::MAIN);
   #endif
 }
 
@@ -1908,8 +2714,8 @@ void Tools::ImageSoftAWB(cv::Mat sourceImg16, cv::Mat& targetImg16, QString CFA,
 
   double gain1, gain2, gain3, gain4;
 
-  qDebug() << "CFA:" << CFA;
-  qDebug() << "gainR:" << gainR << "," << "gainB:" << gainB;
+  Logger::Log("CFA:" + std::string(CFA.toStdString()), LogLevel::INFO, DeviceType::MAIN);
+  Logger::Log("gainR:" + std::to_string(gainR) + "," + "gainB:" + std::to_string(gainB), LogLevel::INFO, DeviceType::MAIN);
 
   if (CFA == "RGGB") {
     gain1 = 1.0 * gainR;
@@ -1951,7 +2757,7 @@ void Tools::ImageSoftAWB(cv::Mat sourceImg16, cv::Mat& targetImg16, QString CFA,
     }
   }
 
-  qDebug() << "ImageSoftAWB | used time (ms) " << t.elapsed();
+  Logger::Log("ImageSoftAWB | used time (ms) " + std::to_string(t.elapsed()), LogLevel::INFO, DeviceType::MAIN);
 }
 
 void Tools::GetAutoStretch(cv::Mat img_raw16, int mode, uint16_t& B,
@@ -1989,6 +2795,18 @@ void Tools::GetAutoStretch(cv::Mat img_raw16, int mode, uint16_t& B,
     wx = bx + 10;
   }  // avoid bx == wx
 
+  // 根据图像位深度调整最大值
+  uint16_t maxValue;
+  if (img_raw16.depth() == CV_8U) {
+    maxValue = 255;
+  } else if (img_raw16.depth() == CV_16U) {
+    maxValue = 65535;
+  } else {
+    // 默认使用16位
+    maxValue = 65535;
+    Logger::Log("GetAutoStretch | unsupported image depth: " + std::to_string(img_raw16.depth()) + ", using 16-bit default", LogLevel::WARNING, DeviceType::MAIN);
+  }
+
   if (bx < 0) bx = 0;
   if (wx > 65535) wx = 65535;
 
@@ -1997,13 +2815,13 @@ void Tools::GetAutoStretch(cv::Mat img_raw16, int mode, uint16_t& B,
 
   // process some sepcial condtion
   // full saturated
-  if (B == 65535 && W == 65535) {
+  if (B == maxValue && W == maxValue) {
     B = 0;
     W = 65535;
   }
   #ifdef ImageDebug
-  qDebug() << "getAutoStretch |mean std B W" << mean.val[0] << std.val[0] << B << W;
-  qDebug() << "getAutoStretch | used time(ms) " << t.elapsed();
+  Logger::Log("getAutoStretch |mean std B W" + std::to_string(mean.val[0]) + " " + std::to_string(std.val[0]) + " " + std::to_string(B) + " " + std::to_string(W), LogLevel::INFO, DeviceType::MAIN);
+  Logger::Log("getAutoStretch | used time(ms) " + std::to_string(t.elapsed()), LogLevel::INFO, DeviceType::MAIN);
   #endif
 }
 
@@ -2025,15 +2843,38 @@ void Tools::Bit16To8_MakeLUT(uint16_t B, uint16_t W, uint8_t* lut) {
     lut[i] = pixel;
   }
   #ifdef ImageDebug
-  qDebug() << "Bit16To8_MakeLUT |" << B << W;
+  Logger::Log("Bit16To8_MakeLUT |" + std::to_string(B) + " " + std::to_string(W), LogLevel::INFO, DeviceType::MAIN);
+  #endif
+}
+
+// 8位图像拉伸LUT生成函数
+static void Bit8To8_MakeLUT(uint8_t B, uint8_t W, uint8_t* lut) {
+  double ratio;
+  uint32_t pixel;
+
+  ratio = double((W - B)) / 256;
+
+  if (ratio == 0) ratio = 1;  // avoid /zero
+
+  for (int i = 0; i < 256; i++) {
+    pixel = i;
+    if (pixel > B) {
+      pixel = (uint32_t)((pixel - B) / ratio);
+      if (pixel > 255) pixel = 255;
+    } else
+      pixel = 0;
+    lut[i] = (uint8_t)pixel;
+  }
+  #ifdef ImageDebug
+  Logger::Log("Bit8To8_MakeLUT |" + std::to_string(B) + " " + std::to_string(W), LogLevel::INFO, DeviceType::MAIN);
   #endif
 }
 
 void Tools::Bit16To8_Stretch(cv::Mat img16, cv::Mat img8, uint16_t B,
                              uint16_t W) {
-  // this API support 16bit image input, 3 channel and 1 channel
+  // this API support 8bit and 16bit image input, 1 channel (grayscale) and 3 channel (color)
   #ifdef ImageDebug
-  qDebug() << "Bit16To8_Stretch | start" << B << W;
+  Logger::Log("Bit16To8_Stretch | start" + std::to_string(B) + " " + std::to_string(W), LogLevel::INFO, DeviceType::MAIN);
   #endif
   QElapsedTimer t;
   t.start();
@@ -2046,20 +2887,50 @@ void Tools::Bit16To8_Stretch(cv::Mat img16, cv::Mat img8, uint16_t B,
   imageX = img16.cols;
   imageY = img16.rows;
 
+  // 检测输入图像位深度
+  bool is8bit = (img16.depth() == CV_8U);
+  bool is16bit = (img16.depth() == CV_16U);
+
+  if (!is8bit && !is16bit) {
+    Logger::Log("Bit16To8_Stretch | unsupported image depth: " + std::to_string(img16.depth()), LogLevel::ERROR, DeviceType::MAIN);
+    return;
+  }
+
   if (img16.channels() == 1) {
-    uint8_t LUT16TO8[65536];
-    Bit16To8_MakeLUT(B, W, LUT16TO8);
+    // 单通道图像（黑白）
+    if (is16bit) {
+      // 16位黑白图像处理
+      uint8_t LUT16TO8[65536];
+      Bit16To8_MakeLUT(B, W, LUT16TO8);
 
-    uint16_t* data16 = (uint16_t*)img16.data;
+      uint16_t* data16 = (uint16_t*)img16.data;
 
-    s = 0;
+      s = 0;
 
-    for (i = 0; i < imageY; i++) {
-      for (j = 0; j < imageX; j++) {
-        pixel = data16[s];  // img16.data[k] + img16.data[k + 1] * 256;
-        img8.data[s] = LUT16TO8[pixel];
-        s = s + 1;
-        // k = k + 1;
+      for (i = 0; i < imageY; i++) {
+        for (j = 0; j < imageX; j++) {
+          pixel = data16[s];
+          img8.data[s] = LUT16TO8[pixel];
+          s = s + 1;
+        }
+      }
+    } else {
+      // 8位黑白图像处理
+      uint8_t B8 = (B > 255) ? 255 : (uint8_t)B;
+      uint8_t W8 = (W > 255) ? 255 : (uint8_t)W;
+      uint8_t LUT8TO8[256];
+      Bit8To8_MakeLUT(B8, W8, LUT8TO8);
+
+      uint8_t* data8 = (uint8_t*)img16.data;
+
+      s = 0;
+
+      for (i = 0; i < imageY; i++) {
+        for (j = 0; j < imageX; j++) {
+          pixel = data8[s];
+          img8.data[s] = LUT8TO8[pixel];
+          s = s + 1;
+        }
       }
     }
 
@@ -2098,31 +2969,63 @@ void Tools::Bit16To8_Stretch(cv::Mat img16, cv::Mat img8, uint16_t B,
   }
 
   else {
-    uint8_t LUT16TO8R[65536];
-    uint8_t LUT16TO8G[65536];
-    uint8_t LUT16TO8B[65536];
-    // here we use the same LUT for RGB channel
-    Bit16To8_MakeLUT(B, W, LUT16TO8R);
-    memcpy(LUT16TO8G, LUT16TO8R, 65536);
-    memcpy(LUT16TO8B, LUT16TO8R, 65536);
+    // 多通道图像（彩色）
+    if (is16bit) {
+      // 16位彩色图像处理
+      uint8_t LUT16TO8R[65536];
+      uint8_t LUT16TO8G[65536];
+      uint8_t LUT16TO8B[65536];
+      // here we use the same LUT for RGB channel
+      Bit16To8_MakeLUT(B, W, LUT16TO8R);
+      memcpy(LUT16TO8G, LUT16TO8R, 65536);
+      memcpy(LUT16TO8B, LUT16TO8R, 65536);
 
-    // this code will take only 50ms for 6000*4000 color image (under release).
-    uint16_t* data16;
+      // this code will take only 50ms for 6000*4000 color image (under release).
+      uint16_t* data16;
 
-    data16 = (uint16_t*)img16.data;
+      data16 = (uint16_t*)img16.data;
 
-    s = 0;
-    for (i = 0; i < imageY; i++) {
-      for (j = 0; j < imageX; j++) {
-        pixel = data16[s];
-        img8.data[s] = LUT16TO8R[pixel];
-        s++;
-        pixel = data16[s];
-        img8.data[s] = LUT16TO8G[pixel];
-        s++;
-        pixel = data16[s];
-        img8.data[s] = LUT16TO8B[pixel];
-        s++;
+      s = 0;
+      for (i = 0; i < imageY; i++) {
+        for (j = 0; j < imageX; j++) {
+          pixel = data16[s];
+          img8.data[s] = LUT16TO8R[pixel];
+          s++;
+          pixel = data16[s];
+          img8.data[s] = LUT16TO8G[pixel];
+          s++;
+          pixel = data16[s];
+          img8.data[s] = LUT16TO8B[pixel];
+          s++;
+        }
+      }
+    } else {
+      // 8位彩色图像处理
+      uint8_t B8 = (B > 255) ? 255 : (uint8_t)B;
+      uint8_t W8 = (W > 255) ? 255 : (uint8_t)W;
+      uint8_t LUT8TO8R[256];
+      uint8_t LUT8TO8G[256];
+      uint8_t LUT8TO8B[256];
+      // here we use the same LUT for RGB channel
+      Bit8To8_MakeLUT(B8, W8, LUT8TO8R);
+      memcpy(LUT8TO8G, LUT8TO8R, 256);
+      memcpy(LUT8TO8B, LUT8TO8R, 256);
+
+      uint8_t* data8 = (uint8_t*)img16.data;
+
+      s = 0;
+      for (i = 0; i < imageY; i++) {
+        for (j = 0; j < imageX; j++) {
+          pixel = data8[s];
+          img8.data[s] = LUT8TO8R[pixel];
+          s++;
+          pixel = data8[s];
+          img8.data[s] = LUT8TO8G[pixel];
+          s++;
+          pixel = data8[s];
+          img8.data[s] = LUT8TO8B[pixel];
+          s++;
+        }
       }
     }
 
@@ -2183,11 +3086,52 @@ void Tools::Bit16To8_Stretch(cv::Mat img16, cv::Mat img8, uint16_t B,
     */
   }
   #ifdef ImageDebug
-  qDebug() << "Bit16To8_Stretch | used time(ms) " << t.elapsed();
+  Logger::Log("Bit16To8_Stretch | used time(ms) " + std::to_string(t.elapsed()), LogLevel::INFO, DeviceType::MAIN);
   #endif
   // cvDebugShow(img16);
   // cvDebugShow(img8);
 }
+
+cv::Mat Tools::convert8UTo16U_BayerSafe(const cv::Mat& mat8u, bool scaleRange) {
+    if (mat8u.empty()) {
+        Logger::Log("convert8UTo16U_BayerSafe | input image is empty", LogLevel::ERROR, DeviceType::MAIN);
+        return cv::Mat();
+    }
+
+    if (mat8u.type() == CV_16UC1) {
+        Logger::Log("convert8UTo16U_BayerSafe | input image is already 16U", LogLevel::INFO, DeviceType::MAIN);
+        return mat8u.clone();
+    }
+    // 1. 输入验证 + 深拷贝（避免外部修改）
+    cv::Mat input = mat8u.clone(); // 深拷贝输入
+
+
+
+    // 3. 确保矩阵连续
+    if (!input.isContinuous()) {
+        input = input.clone();
+    }
+
+    // 4. 创建并初始化输出矩阵
+    cv::Mat mat16u(input.rows, input.cols, CV_16UC1, cv::Scalar(0));
+
+    // 5. 处理数据
+    if (scaleRange) {
+        input.convertTo(mat16u, CV_16UC1, 256.0, 0);
+    } else {
+        // 手动补位（优化版）
+        for (int y = 0; y < input.rows; y++) {
+            const uint8_t* src = input.ptr<uint8_t>(y);
+            uint16_t* dst = mat16u.ptr<uint16_t>(y);
+            for (int x = 0; x < input.cols; x++) {
+                dst[x] = static_cast<uint16_t>(src[x]);
+            }
+        }
+    }
+
+    return mat16u;
+}
+
 
 void Tools::CvDebugShow(cv::Mat img, const std::string& name) {
   cv::namedWindow(name, 0);
@@ -2207,7 +3151,6 @@ void Tools::CvDebugSave(cv::Mat img, const std::string& name) {
     cv::imwrite(name + ".tiff", img);
   }
 }
-
 double Tools::getDecAngle(const QString &str)
 {
     QRegExp rex("([-+]?)\\s*"                   // [sign] (1)
@@ -2297,12 +3240,12 @@ double Tools::getDecAngle(const QString &str)
                 s = x;
                 break;
             default:
-                qDebug() << "internal error, hd = " << hd;
+                Logger::Log("internal error, hd = " + std::to_string(hd), LogLevel::INFO, DeviceType::MAIN);
             }
         }
         else
         {
-            qDebug("getDecAngle failed to parse angle string: "); // << str;
+            Logger::Log("getDecAngle failed to parse angle string: " + str.toStdString(), LogLevel::INFO, DeviceType::MAIN);
             return -0.0;
         }
 
@@ -2335,7 +3278,7 @@ double Tools::getDecAngle(const QString &str)
             // Sanity check - h and N/S not accepted together
             if (isNS)
             {
-                qDebug() << "getDecAngle does not accept ...H...N/S: " << str;
+                Logger::Log("getDecAngle does not accept ...H...N/S: " + str.toStdString(), LogLevel::INFO, DeviceType::MAIN);
                 return -0.0;
             }
             h2d = 15;
@@ -2344,13 +3287,13 @@ double Tools::getDecAngle(const QString &str)
         return deg * 2 * M_PI / 360.;
     }
 
-    qDebug() << "getDecAngle failed to parse angle string: " << str;
+    Logger::Log("getDecAngle failed to parse angle string: " + str.toStdString(), LogLevel::INFO, DeviceType::MAIN);
     return -0.0;
 }
 
 cv::Mat Tools::CalMoments(cv::Mat image)
 {
-  qDebug("CalMoments:1");
+  Logger::Log("CalMoments:1", LogLevel::INFO, DeviceType::MAIN);
   cv::Mat grayImage;
   if(image.channels() == 1)
   {
@@ -2360,7 +3303,7 @@ cv::Mat Tools::CalMoments(cv::Mat image)
   {
     cvtColor(image, grayImage, CV_RGB2GRAY);
   }
-  qDebug("CalMoments:2");
+  Logger::Log("CalMoments:2", LogLevel::INFO, DeviceType::MAIN);
  
 
   return image;
@@ -2380,8 +3323,8 @@ cv::Mat Tools::SubBackGround(cv::Mat image)
     cv::Scalar scalar = mean(gray);
     double Background = scalar.val[0];
 
-    // qDebug("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    // qDebug() << "Backgroud brightness:" << Background;
+    Logger::Log("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~", LogLevel::INFO, DeviceType::MAIN);
+    Logger::Log("Backgroud brightness:" + std::to_string(Background), LogLevel::INFO, DeviceType::MAIN);
 
     cv::Mat m = cv::Mat(gray.size(), gray.type(), cv::Scalar(Background));
     cv::Mat dst = cv::Mat::zeros(gray.size(), gray.type());
@@ -2445,14 +3388,51 @@ QList<FITSImage::Star> Tools::FindStarsByStellarSolver(bool AllStars, bool runHF
 
   if (!result.success)
   {
-    printf("Error in loading FITS file");
+    Logger::Log("Error in loading FITS file", LogLevel::INFO, DeviceType::MAIN);
     return stars;
   }
 
   FITSImage::Statistic imageStats = result.imageStats;
   uint8_t *imageBuffer = result.imageBuffer;
   stars = tempTool.FindStarsByStellarSolver_(AllStars, imageStats, imageBuffer, runHFR);
+  
+  // 释放 imageBuffer 内存，避免内存泄漏
+  if (imageBuffer != nullptr)
+  {
+    delete[] imageBuffer;
+    imageBuffer = nullptr;
+  }
+  
   return stars;
+}
+
+int Tools::FindStarsCountFromFile(QString fileName, bool AllStars, bool runHFR)
+{
+  Tools tempTool;
+  
+  loadFitsResult result = loadFits(fileName);
+  
+  if (!result.success)
+  {
+    Logger::Log("Error in loading FITS file: " + fileName.toStdString(), LogLevel::ERROR, DeviceType::MAIN);
+    return -1;
+  }
+  
+  FITSImage::Statistic imageStats = result.imageStats;
+  uint8_t *imageBuffer = result.imageBuffer;
+  QList<FITSImage::Star> stars = tempTool.FindStarsByStellarSolver_(AllStars, imageStats, imageBuffer, runHFR);
+  
+  int starCount = stars.size();
+  Logger::Log("Found " + std::to_string(starCount) + " stars in file: " + fileName.toStdString(), LogLevel::INFO, DeviceType::MAIN);
+  
+  // 释放 imageBuffer 内存，避免内存泄漏
+  if (imageBuffer != nullptr)
+  {
+    delete[] imageBuffer;
+    imageBuffer = nullptr;
+  }
+  
+  return starCount;
 }
 
 QList<FITSImage::Star> Tools::FindStarsByStellarSolver_(bool AllStars, const FITSImage::Statistic &imagestats, const uint8_t *imageBuffer, bool runHFR)
@@ -2481,41 +3461,41 @@ QList<FITSImage::Star> Tools::FindStarsByStellarSolver_(bool AllStars, const FIT
   // parameters.removeDimmest = 20;                    // 移除最暗星点比例
   // parameters.saturationLimit = 90;                  // 饱和度限制
   
-  parameters.apertureShape = SSolver::SHAPE_CIRCLE;
-  parameters.autoDownsample = true;
-  parameters.clean = 1;
-  parameters.clean_param = 1;
-  parameters.convFilterType = SSolver::CONV_GAUSSIAN;
-  parameters.deblend_contrast = 0.004999999888241291;
-  parameters.deblend_thresh = 32;
-  parameters.description = "Default focus star-extraction.";
-  parameters.downsample = 1;
-  parameters.fwhm = 1;
-  parameters.inParallel = true;
-  parameters.initialKeep = 250;
-  parameters.keepNum = 100;
-  parameters.kron_fact = 2.5;
-  parameters.listName = "1-Focus-Default";
-  parameters.logratio_tokeep = 20.72326583694641;
-  parameters.logratio_tosolve = 20.72326583694641;
-  parameters.logratio_totune = 13.815510557964274;
-  parameters.magzero = 20;
-  parameters.maxEllipse = 1.5;
-  parameters.maxSize = 10;
-  parameters.maxwidth = 180;
-  parameters.minSize = 0;
-  parameters.minarea = 20;
-  parameters.minwidth = 0.1;
-  parameters.multiAlgorithm = SSolver::MULTI_AUTO;
-  parameters.partition = true;
-  parameters.r_min = 5;
-  parameters.removeBrightest = 10;
-  parameters.removeDimmest = 20;
-  parameters.resort = true;
-  parameters.saturationLimit = 90;
-  parameters.search_parity = 15;
-  parameters.solverTimeLimit = 600;
-  parameters.subpix = 5;
+  parameters.apertureShape = SSolver::SHAPE_CIRCLE;        // 孔径形状：圆形
+  parameters.autoDownsample = true;                        // 自动降采样：启用
+  parameters.clean = 1;                                    // 清理参数：启用图像清理
+  parameters.clean_param = 1;                              // 清理参数值：1
+  parameters.convFilterType = SSolver::CONV_GAUSSIAN;     // 卷积滤波器类型：高斯滤波
+  parameters.deblend_contrast = 0.004999999888241291;     // 去混叠对比度阈值
+  parameters.deblend_thresh = 32;                          // 去混叠阈值
+  parameters.description = "Default focus star-extraction."; // 参数描述：默认焦点星点提取
+  parameters.downsample = 1;                               // 降采样因子：1（不降采样）
+  parameters.fwhm = 1;                                     // 全宽半高：1像素
+  parameters.inParallel = true;                            // 并行处理：启用
+  parameters.initialKeep = 250;                            // 初始保留星点数量：250个
+  parameters.keepNum = 100;                                // 最终保留星点数量：100个
+  parameters.kron_fact = 2.5;                              // Kron因子：2.5
+  parameters.listName = "1-Focus-Default";                 // 列表名称：1-焦点-默认
+  parameters.logratio_tokeep = 20.72326583694641;         // 保留星点的对数比率阈值
+  parameters.logratio_tosolve = 20.72326583694641;        // 求解星点的对数比率阈值
+  parameters.logratio_totune = 13.815510557964274;        // 调优星点的对数比率阈值
+  parameters.magzero = 20;                                 // 零点星等：20
+  parameters.maxEllipse = 1.5;                             // 最大椭圆比：1.5
+  parameters.maxSize = 10;                                 // 最大星点尺寸：10像素
+  parameters.maxwidth = 180;                               // 最大宽度：180像素
+  parameters.minSize = 0;                                  // 最小星点尺寸：0像素
+  parameters.minarea = 20;                                 // 最小星点面积：20像素
+  parameters.minwidth = 0.1;                               // 最小宽度：0.1像素
+  parameters.multiAlgorithm = SSolver::MULTI_AUTO;        // 多算法模式：自动选择
+  parameters.partition = true;                             // 分区处理：启用
+  parameters.r_min = 5;                                    // 最小星点半径：5像素
+  parameters.removeBrightest = 10;                         // 移除最亮星点比例：10%
+  parameters.removeDimmest = 20;                           // 移除最暗星点比例：20%
+  parameters.resort = true;                                // 重新排序：启用
+  parameters.saturationLimit = 90;                         // 饱和度限制：90%
+  parameters.search_parity = 15;                           // 搜索奇偶性：15
+  parameters.solverTimeLimit = 600;                        // 求解器时间限制：600秒
+  parameters.subpix = 5;                                   // 子像素精度：5
 
 
   solver.setLogLevel(SSolver::LOG_ALL);
@@ -2539,26 +3519,55 @@ QList<FITSImage::Star> Tools::FindStarsByStellarSolver_(bool AllStars, const FIT
   bool success = solver.extract(runHFR);
   if (!success)
   {
-    std::cerr << "Star extraction failed." << std::endl;
+    Logger::Log("Star extraction failed.", LogLevel::INFO, DeviceType::MAIN);
   }
-  qDebug() << "success extract: " << success;
+  Logger::Log("success extract: " + std::to_string(success), LogLevel::INFO, DeviceType::MAIN);
 
   QList<FITSImage::Star> stars;
 
-  stars = solver.getStarList();
+  try {
+    stars = solver.getStarList();
+    Logger::Log("Successfully got star list with " + std::to_string(stars.size()) + " stars.", LogLevel::INFO, DeviceType::MAIN);
+  } catch (const std::exception &e) {
+    Logger::Log("Exception getting star list: " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+    return QList<FITSImage::Star>();
+  } catch (...) {
+    Logger::Log("Unknown exception getting star list", LogLevel::ERROR, DeviceType::MAIN);
+    return QList<FITSImage::Star>();
+  }
 
-  // 输出检测到的星点信息
-  std::cout << "Detected " << stars.size() << " stars." << std::endl;
-  for (const auto &star : stars)
-  {
-    // std::cout << "Star at (" << star.x << ", " << star.y << ") with HFR: " << star.HFR << std::endl;
+  // 输出检测到的星点信息，但避免访问可能损坏的内存
+  Logger::Log("Detected " + std::to_string(stars.size()) + " stars.", LogLevel::INFO, DeviceType::MAIN);
+  
+  // 安全地遍历前几个星点进行调试
+  int debugCount = 0;
+  if (stars.size() > 0) {
+    for (const auto &star : stars)
+    {
+      if (debugCount >= 3) break; // 只调试前3个星点
+      
+      try {
+        Logger::Log("Star " + std::to_string(debugCount) + " at (" + 
+                    std::to_string(star.x) + ", " + std::to_string(star.y) + 
+                    ") with HFR: " + std::to_string(star.HFR), LogLevel::INFO, DeviceType::MAIN);
+      } catch (const std::exception &e) {
+        Logger::Log("Exception accessing star " + std::to_string(debugCount) + ": " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+        break;
+      } catch (...) {
+        Logger::Log("Unknown exception accessing star " + std::to_string(debugCount), LogLevel::ERROR, DeviceType::MAIN);
+        break;
+      }
+      debugCount++;
+    }
+  } else {
+    Logger::Log("No stars detected, skipping star info output", LogLevel::INFO, DeviceType::MAIN);
   }
 
   return stars;
 }
 
 void Tools::StellarSolverLogOutput(QString text){
-  // qDebug() << "StellarSolver LogOutput: " << text.toUtf8().data();
+  // Logger::Log("StellarSolver LogOutput: " + text.toStdString(), LogLevel::INFO, DeviceType::MAIN);
 }
 
 loadFitsResult Tools::loadFits(QString fileName)
@@ -2579,7 +3588,7 @@ loadFitsResult Tools::loadFits(QString fileName)
   if (fits_open_diskfile(&fptr, file.toLocal8Bit(), READONLY, &status))
   {
     // logIssue(QString("Error opening fits file %1").arg(file));
-    qDebug() << "Error opening fits file " << file;
+    Logger::Log("Error opening fits file " + file.toStdString(), LogLevel::ERROR, DeviceType::MAIN);
     result.success = false;
     return result;
   }
@@ -2589,7 +3598,7 @@ loadFitsResult Tools::loadFits(QString fileName)
   if (fits_movabs_hdu(fptr, 1, IMAGE_HDU, &status))
   {
     // logIssue(QString("Could not locate image HDU."));
-    qDebug() << "Could not locate image HDU.";
+    Logger::Log("Could not locate image HDU.", LogLevel::INFO, DeviceType::MAIN);
     fits_close_file(fptr, &status);
     result.success = false;
     return result;
@@ -2599,7 +3608,7 @@ loadFitsResult Tools::loadFits(QString fileName)
   if (fits_get_img_param(fptr, 3, &fitsBitPix, &(stats.ndim), naxes, &status))
   {
     // logIssue(QString("FITS file open error (fits_get_img_param)."));
-    qDebug() << "FITS file open error (fits_get_img_param).";
+    Logger::Log("FITS file open error (fits_get_img_param).", LogLevel::WARNING, DeviceType::MAIN);
     fits_close_file(fptr, &status);
     result.success = false;
     return result;
@@ -2608,7 +3617,7 @@ loadFitsResult Tools::loadFits(QString fileName)
   if (stats.ndim < 2)
   {
     // logIssue("1D FITS images are not supported.");
-    qDebug() << "1D FITS images are not supported.";
+    Logger::Log("1D FITS images are not supported.", LogLevel::WARNING, DeviceType::MAIN);
     fits_close_file(fptr, &status);
     result.success = false;
     return result;
@@ -2653,7 +3662,7 @@ loadFitsResult Tools::loadFits(QString fileName)
     break;
   default:
     // logIssue(QString("Bit depth %1 is not supported.").arg(fitsBitPix));
-    qDebug() << "Bit depth %1 is not supported." << fitsBitPix;
+    Logger::Log("Bit depth %1 is not supported." + std::to_string(fitsBitPix), LogLevel::WARNING, DeviceType::MAIN);
 
     fits_close_file(fptr, &status);
     result.success = false;
@@ -2666,7 +3675,7 @@ loadFitsResult Tools::loadFits(QString fileName)
   if (naxes[0] == 0 || naxes[1] == 0)
   {
     // logIssue(QString("Image has invalid dimensions %1x%2").arg(naxes[0]).arg(naxes[1]));
-    qDebug() << "Image has invalid dimensions " << naxes[0] << naxes[1];
+    Logger::Log("Image has invalid dimensions." + std::to_string(naxes[0]) + " " + std::to_string(naxes[1]), LogLevel::WARNING, DeviceType::MAIN);
   }
 
   stats.width = static_cast<uint16_t>(naxes[0]);
@@ -2686,7 +3695,7 @@ loadFitsResult Tools::loadFits(QString fileName)
   if (m_ImageBuffer == nullptr)
   {
     // logIssue(QString("FITSData: Not enough memory for image_buffer channel. Requested: %1 bytes ").arg(m_ImageBufferSize));
-    qDebug() << "FITSData: Not enough memory for image_buffer channel. Requested:" << m_ImageBufferSize << "bytes ";
+    Logger::Log("FITSData: Not enough memory for image_buffer channel. Requested:" + std::to_string(m_ImageBufferSize) + "bytes ", LogLevel::WARNING, DeviceType::MAIN);
     fits_close_file(fptr, &status);
     result.success = false;
     return result;
@@ -2697,7 +3706,13 @@ loadFitsResult Tools::loadFits(QString fileName)
   if (fits_read_img(fptr, static_cast<uint16_t>(stats.dataType), 1, nelements, nullptr, m_ImageBuffer, &anynullptr, &status))
   {
     // logIssue("Error reading image.");
-    qDebug() << "Error reading image.";
+    Logger::Log("Error reading image.", LogLevel::WARNING, DeviceType::MAIN);
+    // 读取失败时释放已分配的内存
+    if (m_ImageBuffer != nullptr)
+    {
+      delete[] m_ImageBuffer;
+      m_ImageBuffer = nullptr;
+    }
     fits_close_file(fptr, &status);
     result.success = false;
     return result;
@@ -2748,14 +3763,14 @@ FWHM_Result Tools::CalculateFWHM(cv::Mat image)
     FirstMoment_y = yCoordinate;
 //------------------------------------------------------------
 
-    qDebug() << "Barycentric Coordinate:" << FirstMoment_x << "," << FirstMoment_y;
+    Logger::Log("Barycentric Coordinate:" + std::to_string(FirstMoment_x) + "," + std::to_string(FirstMoment_y), LogLevel::INFO, DeviceType::MAIN);
 
 
     int height = subimage.rows;
     int width = subimage.cols;
 
     ushort Bri1 = subimage.at<ushort>(FirstMoment_y, FirstMoment_x);
-    qDebug() << "Max:" << Bri1;
+    Logger::Log("Max:" + std::to_string(Bri1), LogLevel::INFO, DeviceType::MAIN);
 
     int x_s, x_b;
     // for (int i = FirstMoment_x; i > 0; i--)
@@ -2782,9 +3797,9 @@ FWHM_Result Tools::CalculateFWHM(cv::Mat image)
 
     // double FWHM = (x_b - x_s)/10.0;
     double FWHM = static_cast<double>(x_b-x_s)/10.0;
-    qDebug() << x_b << x_s;
+    Logger::Log("x_b:" + std::to_string(x_b) + " x_s:" + std::to_string(x_s), LogLevel::INFO, DeviceType::MAIN);
 
-    qDebug() << "[[[[[FWHM:" << FWHM << "]]]]]";
+    Logger::Log("[[[[FWHM:" + std::to_string(FWHM) + "]]]]]", LogLevel::INFO, DeviceType::MAIN);
     // qDebug("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
 
     cv::Mat imagePoint = image.clone();
@@ -2801,7 +3816,6 @@ FWHM_Result Tools::CalculateFWHM(cv::Mat image)
 
     return result;
 }
-
 HFR_Result Tools::CalculateHFR(cv::Mat image)
 {
     HFR_Result result;
@@ -2903,63 +3917,480 @@ CamBin Tools::mergeImageBasedOnSize(cv::Mat image) {
 
 cv::Mat Tools::processMatWithBinAvg(cv::Mat &image, uint32_t camxbin, uint32_t camybin, bool isColor, bool isAVG)
 {
-  uint32_t width = image.cols;
-  uint32_t height = image.rows;
-  uint32_t depth = image.elemSize() * 8; // 每个像素的位深
-  uint32_t camchannels = image.channels();
-
-  // 获取输入数据指针
-  uint8_t *srcdata = image.data;
-
-  // 根据位深设置输出数据的大小
-  uint32_t outputSize;
-  qDebug("Set output size.");
-  if (depth == 8) {
-    outputSize = (width / camxbin) * (height / camybin);
-  }
-  else if (depth == 16) {
-    outputSize = 2 * (width / camxbin) * (height / camybin);
-  }
-  else if (depth == 32) {
-    outputSize = 4 * (width / camxbin) * (height / camybin);
-  }
-  else {
-    std::cerr << "Unsupported depth!" << std::endl;
-  }
-
-  // 分配输出数据的内存
-  std::vector<uint8_t> bindata(outputSize, 0);
-
-  // 调用合并函数
-  uint32_t result;
-  if(isAVG) {
-    result = PixelsDataSoftBin_AVG(srcdata, bindata.data(), width, height, depth, camxbin, camybin);
-  } else {
-    result = PixelsDataSoftBin(srcdata, bindata.data(), width, height, camchannels, depth, camxbin, camybin, isColor);
-  }
-
-  if (result == QHYCCD_SUCCESS) {
-    // 处理成功，根据位深设置输出图像
-    qDebug("PixelsDataSoftBin Success.");
+    // 输入参数验证
+    if (image.empty()) {
+        Logger::Log("输入图像为空", LogLevel::ERROR, DeviceType::MAIN);
+        return cv::Mat();
+    }
+    
+    if (camxbin == 0 || camybin == 0) {
+        Logger::Log("binning参数无效: x=" + std::to_string(camxbin) + " y=" + std::to_string(camybin), 
+                   LogLevel::ERROR, DeviceType::MAIN);
+        return cv::Mat();
+    }
+    
+    uint32_t width = image.cols;
+    uint32_t height = image.rows;
+    
+    // 检查图像尺寸是否足够binning
+    if (width < camxbin || height < camybin) {
+        Logger::Log("图像尺寸小于binning大小", LogLevel::ERROR, DeviceType::MAIN);
+        return cv::Mat();
+    }
+    
+    // 计算新尺寸
     int newWidth = width / camxbin;
     int newHeight = height / camybin;
-    qDebug() << "newWidth:" << newWidth << ", newHeight:" << newHeight;
-    if (depth == 8) {
-      return cv::Mat(newHeight, newWidth, CV_8U, bindata.data());
+    
+    // 确保有效尺寸
+    if (newWidth <= 0 || newHeight <= 0) {
+        Logger::Log("binning后图像尺寸无效", LogLevel::ERROR, DeviceType::MAIN);
+        return cv::Mat();
     }
-    else if (depth == 16) {
-      return cv::Mat(newHeight, newWidth, CV_16U, bindata.data());
+    
+    cv::Mat outputImage;
+    
+    try {
+        if (isAVG) {
+            // 使用OpenCV resize实现平均值binning
+            cv::resize(image, outputImage, cv::Size(newWidth, newHeight), 0, 0, cv::INTER_AREA);
+        } else {
+            // 根据图像类型选择处理方法
+            int depth = image.depth();
+            int type = image.type();
+            
+            if (isColor && image.channels() == 3) {
+                // 彩色图像处理
+                cv::resize(image, outputImage, cv::Size(newWidth, newHeight), 0, 0, cv::INTER_AREA);
+            } else {
+                // 单色图像处理
+                // 创建目标图像
+                outputImage = cv::Mat(newHeight, newWidth, type);
+                outputImage.setTo(0); // 初始化为0
+                
+                // 选择适当的处理方法
+                if (depth == CV_8U) {
+                    // 8位图像binning
+                    for (int y = 0; y < newHeight; y++) {
+                        for (int x = 0; x < newWidth; x++) {
+                            int sum = 0;
+                            for (int by = 0; by < camybin; by++) {
+                                for (int bx = 0; bx < camxbin; bx++) {
+                                    int srcY = y * camybin + by;
+                                    int srcX = x * camxbin + bx;
+                                    if (srcY < height && srcX < width) {
+                                        sum += image.at<uint8_t>(srcY, srcX);
+                                    }
+                                }
+                            }
+                            outputImage.at<uint8_t>(y, x) = (uint8_t)std::min(255, sum);
+                        }
+                    }
+                } else if (depth == CV_16U) {
+                    // 16位图像binning
+                    for (int y = 0; y < newHeight; y++) {
+                        for (int x = 0; x < newWidth; x++) {
+                            int sum = 0;
+                            for (int by = 0; by < camybin; by++) {
+                                for (int bx = 0; bx < camxbin; bx++) {
+                                    int srcY = y * camybin + by;
+                                    int srcX = x * camxbin + bx;
+                                    if (srcY < height && srcX < width) {
+                                        sum += image.at<uint16_t>(srcY, srcX);
+                                    }
+                                }
+                            }
+                            outputImage.at<uint16_t>(y, x) = (uint16_t)std::min(65535, sum);
+                        }
+                    }
+                } else if (depth == CV_32S) {
+                    // 32位图像binning
+                    for (int y = 0; y < newHeight; y++) {
+                        for (int x = 0; x < newWidth; x++) {
+                            int64_t sum = 0;
+                            for (int by = 0; by < camybin; by++) {
+                                for (int bx = 0; bx < camxbin; bx++) {
+                                    int srcY = y * camybin + by;
+                                    int srcX = x * camxbin + bx;
+                                    if (srcY < height && srcX < width) {
+                                        sum += image.at<int32_t>(srcY, srcX);
+                                    }
+                                }
+                            }
+                            outputImage.at<int32_t>(y, x) = (int32_t)sum;
+                        }
+                    }
+                }
+            }
+        }
+    } catch (const cv::Exception& e) {
+        Logger::Log("OpenCV错误: " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+        return cv::Mat();
+    } catch (const std::exception& e) {
+        Logger::Log("处理错误: " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+        return cv::Mat();
     }
-    else if (depth == 32) {
-      return cv::Mat(newHeight, newWidth, CV_32S, bindata.data());
+    
+    // 确保宽高都是偶数
+    int finalWidth = outputImage.cols;
+    int finalHeight = outputImage.rows;
+    
+    if (finalWidth % 2 != 0 || finalHeight % 2 != 0) {
+        int cropWidth = finalWidth - (finalWidth % 2);
+        int cropHeight = finalHeight - (finalHeight % 2);
+        
+        if (cropWidth > 0 && cropHeight > 0) {
+            cv::Rect roi(0, 0, cropWidth, cropHeight);
+            return outputImage(roi).clone();
+        }
     }
-    qDebug("Output Image Success.");
-  }
-  else {
-    std::cerr << "Error in PixelsDataSoftBin_AVG function." << std::endl;
-  }
+    
+    return outputImage;
 }
+// 修改后的 Bayer 阵列处理函数，支持不同的 Bayer 模式
+cv::Mat Tools::PixelsDataSoftBin_Bayer(cv::Mat srcMat, uint32_t camxbin, uint32_t camybin, BayerPattern bayerPattern)
+{
+  // 打印输入参数
+  Logger::Log("PixelsDataSoftBin_Bayer | 输入图像: " + std::to_string(srcMat.cols) + "x" + std::to_string(srcMat.rows) + 
+              " 类型:" + std::to_string(srcMat.type()) + " bin:" + std::to_string(camxbin) + "x" + std::to_string(camybin),
+              LogLevel::INFO, DeviceType::MAIN);
 
+  if (srcMat.empty()) {
+    Logger::Log("输入图像为空", LogLevel::ERROR, DeviceType::MAIN);
+    return cv::Mat();
+  }
+  
+  uint32_t width = srcMat.cols;
+  uint32_t height = srcMat.rows;
+  uint32_t depth = 0;
+  
+  // 根据Mat的类型确定位深度
+  if (srcMat.type() == CV_8U) {
+    depth = 8;
+    Logger::Log("PixelsDataSoftBin_Bayer | 处理8位图像", LogLevel::INFO, DeviceType::MAIN);
+  } else if (srcMat.type() == CV_16U) {
+    depth = 16;
+    Logger::Log("PixelsDataSoftBin_Bayer | 处理16位图像", LogLevel::INFO, DeviceType::MAIN);
+  } else if (srcMat.type() == CV_32S) {
+    depth = 32;
+    Logger::Log("PixelsDataSoftBin_Bayer | 处理32位图像", LogLevel::INFO, DeviceType::MAIN);
+  } else {
+    Logger::Log("不支持的图像类型: " + std::to_string(srcMat.type()), LogLevel::ERROR, DeviceType::MAIN);
+    return cv::Mat();
+  }
+  
+  uint32_t newWidth = width / camxbin;
+  uint32_t newHeight = height / camybin;
+  
+  // 检查新图像尺寸是否为0
+  if (newWidth == 0 || newHeight == 0) {
+    Logger::Log("PixelsDataSoftBin_Bayer | 错误: 缩放后尺寸为0! " + std::to_string(newWidth) + "x" + std::to_string(newHeight), 
+                LogLevel::ERROR, DeviceType::MAIN);
+    return cv::Mat();
+  }
+  
+  Logger::Log("PixelsDataSoftBin_Bayer | 新图像尺寸: " + std::to_string(newWidth) + "x" + std::to_string(newHeight), 
+              LogLevel::INFO, DeviceType::MAIN);
+  
+  // 创建输出图像
+  cv::Mat binMat;
+  try {
+    if (depth == 8) {
+      binMat = cv::Mat::zeros(newHeight, newWidth, CV_8U);
+    } else if (depth == 16) {
+      binMat = cv::Mat::zeros(newHeight, newWidth, CV_16U);
+    } else if (depth == 32) {
+      binMat = cv::Mat::zeros(newHeight, newWidth, CV_32S);
+    }
+    Logger::Log("PixelsDataSoftBin_Bayer | 输出图像创建成功", LogLevel::INFO, DeviceType::MAIN);
+  } catch (cv::Exception &e) {
+    Logger::Log("PixelsDataSoftBin_Bayer | 创建输出图像异常: " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+    return cv::Mat();
+  }
+  
+  // 根据 Bayer 模式确定各通道在 2x2 块中的位置
+  int rOffsetY, rOffsetX, g1OffsetY, g1OffsetX, g2OffsetY, g2OffsetX, bOffsetY, bOffsetX;
+  
+  switch (bayerPattern) {
+    case BAYER_RGGB:  // RGGB: R(0,0), G1(0,1), G2(1,0), B(1,1)
+      rOffsetY = 0; rOffsetX = 0;
+      g1OffsetY = 0; g1OffsetX = 1;
+      g2OffsetY = 1; g2OffsetX = 0;
+      bOffsetY = 1; bOffsetX = 1;
+      Logger::Log("PixelsDataSoftBin_Bayer | 使用RGGB模式", LogLevel::INFO, DeviceType::MAIN);
+      break;
+    case BAYER_BGGR:  // BGGR: B(0,0), G1(0,1), G2(1,0), R(1,1)
+      bOffsetY = 0; bOffsetX = 0;
+      g1OffsetY = 0; g1OffsetX = 1;
+      g2OffsetY = 1; g2OffsetX = 0;
+      rOffsetY = 1; rOffsetX = 1;
+      Logger::Log("PixelsDataSoftBin_Bayer | 使用BGGR模式", LogLevel::INFO, DeviceType::MAIN);
+      break;
+    case BAYER_GRBG:  // GRBG: G1(0,0), R(0,1), B(1,0), G2(1,1)
+      g1OffsetY = 0; g1OffsetX = 0;
+      rOffsetY = 0; rOffsetX = 1;
+      bOffsetY = 1; bOffsetX = 0;
+      g2OffsetY = 1; g2OffsetX = 1;
+      Logger::Log("PixelsDataSoftBin_Bayer | 使用GRBG模式", LogLevel::INFO, DeviceType::MAIN);
+      break;
+    case BAYER_GBRG:  // GBRG: G1(0,0), B(0,1), R(1,0), G2(1,1)
+      g1OffsetY = 0; g1OffsetX = 0;
+      bOffsetY = 0; bOffsetX = 1;
+      rOffsetY = 1; rOffsetX = 0;
+      g2OffsetY = 1; g2OffsetX = 1;
+      Logger::Log("PixelsDataSoftBin_Bayer | 使用GBRG模式", LogLevel::INFO, DeviceType::MAIN);
+      break;
+    default:
+      Logger::Log("不支持的 Bayer 模式", LogLevel::ERROR, DeviceType::MAIN);
+      binMat.release();  // 释放已分配的内存
+      return cv::Mat();
+  }
+  try {
+    // 根据位深度选择不同的处理逻辑
+    if (depth == 8)
+    {
+      Logger::Log("PixelsDataSoftBin_Bayer | 处理8位图像数据", LogLevel::INFO, DeviceType::MAIN);
+      // 处理 8 位 Bayer 阵列
+      for (uint32_t by = 0; by < height; by += camybin * 2)
+      {
+        for (uint32_t bx = 0; bx < width; bx += camxbin * 2)
+        {
+          // 分别处理四个通道
+          uint32_t sumR = 0, sumG1 = 0, sumG2 = 0, sumB = 0;
+          uint32_t countR = 0, countG1 = 0, countG2 = 0, countB = 0;
+          
+          // 累加每个 Bayer 块中的像素值
+          for (uint32_t y = 0; y < camybin * 2 && by + y < height; y += 2)
+          {
+            for (uint32_t x = 0; x < camxbin * 2 && bx + x < width; x += 2)
+            {
+              // R 位置
+              if (by + y + rOffsetY < height && bx + x + rOffsetX < width) {
+                sumR += srcMat.at<uint8_t>(by + y + rOffsetY, bx + x + rOffsetX);
+                countR++;
+              }
+              
+              // G1 位置
+              if (by + y + g1OffsetY < height && bx + x + g1OffsetX < width) {
+                sumG1 += srcMat.at<uint8_t>(by + y + g1OffsetY, bx + x + g1OffsetX);
+                countG1++;
+              }
+              
+              // G2 位置
+              if (by + y + g2OffsetY < height && bx + x + g2OffsetX < width) {
+                sumG2 += srcMat.at<uint8_t>(by + y + g2OffsetY, bx + x + g2OffsetX);
+                countG2++;
+              }
+              
+              // B 位置
+              if (by + y + bOffsetY < height && bx + x + bOffsetX < width) {
+                sumB += srcMat.at<uint8_t>(by + y + bOffsetY, bx + x + bOffsetX);
+                countB++;
+              }
+            }
+          }
+          
+          // 计算平均值并写入输出缓冲区，保持相同的 Bayer 模式
+          uint32_t newY = by / camybin / 2;
+          uint32_t newX = bx / camxbin / 2;
+          
+          // 添加边界检查，确保不会越界访问
+          if (newY * 2 + rOffsetY < newHeight && newX * 2 + rOffsetX < newWidth && countR > 0)
+            binMat.at<uint8_t>(newY * 2 + rOffsetY, newX * 2 + rOffsetX) = sumR / countR;
+          
+          if (newY * 2 + g1OffsetY < newHeight && newX * 2 + g1OffsetX < newWidth && countG1 > 0)
+            binMat.at<uint8_t>(newY * 2 + g1OffsetY, newX * 2 + g1OffsetX) = sumG1 / countG1;
+          
+          if (newY * 2 + g2OffsetY < newHeight && newX * 2 + g2OffsetX < newWidth && countG2 > 0)
+            binMat.at<uint8_t>(newY * 2 + g2OffsetY, newX * 2 + g2OffsetX) = sumG2 / countG2;
+          
+          if (newY * 2 + bOffsetY < newHeight && newX * 2 + bOffsetX < newWidth && countB > 0)
+            binMat.at<uint8_t>(newY * 2 + bOffsetY, newX * 2 + bOffsetX) = sumB / countB;
+        }
+      }
+    }
+    else if (depth == 16)
+    {
+      Logger::Log("PixelsDataSoftBin_Bayer | 处理16位图像数据", LogLevel::INFO, DeviceType::MAIN);
+      // 处理 16 位 Bayer 阵列
+      for (uint32_t by = 0; by < height; by += camybin * 2)
+      {
+        for (uint32_t bx = 0; bx < width; bx += camxbin * 2)
+        {
+          uint32_t sumR = 0, sumG1 = 0, sumG2 = 0, sumB = 0;
+          uint32_t countR = 0, countG1 = 0, countG2 = 0, countB = 0;
+          
+          for (uint32_t y = 0; y < camybin * 2 && by + y < height; y += 2)
+          {
+            for (uint32_t x = 0; x < camxbin * 2 && bx + x < width; x += 2)
+            {
+              if (by + y + rOffsetY < height && bx + x + rOffsetX < width) {
+                sumR += srcMat.at<uint16_t>(by + y + rOffsetY, bx + x + rOffsetX);
+                countR++;
+              }
+              
+              if (by + y + g1OffsetY < height && bx + x + g1OffsetX < width) {
+                sumG1 += srcMat.at<uint16_t>(by + y + g1OffsetY, bx + x + g1OffsetX);
+                countG1++;
+              }
+              
+              if (by + y + g2OffsetY < height && bx + x + g2OffsetX < width) {
+                sumG2 += srcMat.at<uint16_t>(by + y + g2OffsetY, bx + x + g2OffsetX);
+                countG2++;
+              }
+              
+              if (by + y + bOffsetY < height && bx + x + bOffsetX < width) {
+                sumB += srcMat.at<uint16_t>(by + y + bOffsetY, bx + x + bOffsetX);
+                countB++;
+              }
+            }
+          }
+          
+          uint32_t newY = by / camybin / 2;
+          uint32_t newX = bx / camxbin / 2;
+          
+          // 添加边界检查，确保不会越界访问
+          if (newY * 2 + rOffsetY < newHeight && newX * 2 + rOffsetX < newWidth && countR > 0)
+            binMat.at<uint16_t>(newY * 2 + rOffsetY, newX * 2 + rOffsetX) = sumR / countR;
+          
+          if (newY * 2 + g1OffsetY < newHeight && newX * 2 + g1OffsetX < newWidth && countG1 > 0)
+            binMat.at<uint16_t>(newY * 2 + g1OffsetY, newX * 2 + g1OffsetX) = sumG1 / countG1;
+          
+          if (newY * 2 + g2OffsetY < newHeight && newX * 2 + g2OffsetX < newWidth && countG2 > 0)
+            binMat.at<uint16_t>(newY * 2 + g2OffsetY, newX * 2 + g2OffsetX) = sumG2 / countG2;
+          
+          if (newY * 2 + bOffsetY < newHeight && newX * 2 + bOffsetX < newWidth && countB > 0)
+            binMat.at<uint16_t>(newY * 2 + bOffsetY, newX * 2 + bOffsetX) = sumB / countB;
+        }
+      }
+    }
+    else if (depth == 32)
+    {
+      Logger::Log("PixelsDataSoftBin_Bayer | 处理32位图像数据", LogLevel::INFO, DeviceType::MAIN);
+      // 处理 32 位 Bayer 阵列
+      for (uint32_t by = 0; by < height; by += camybin * 2)
+      {
+        for (uint32_t bx = 0; bx < width; bx += camxbin * 2)
+        {
+          uint64_t sumR = 0, sumG1 = 0, sumG2 = 0, sumB = 0;
+          uint32_t countR = 0, countG1 = 0, countG2 = 0, countB = 0;
+          
+          for (uint32_t y = 0; y < camybin * 2 && by + y < height; y += 2)
+          {
+            for (uint32_t x = 0; x < camxbin * 2 && bx + x < width; x += 2)
+            {
+              if (by + y + rOffsetY < height && bx + x + rOffsetX < width) {
+                sumR += srcMat.at<int32_t>(by + y + rOffsetY, bx + x + rOffsetX);
+                countR++;
+              }
+              
+              if (by + y + g1OffsetY < height && bx + x + g1OffsetX < width) {
+                sumG1 += srcMat.at<int32_t>(by + y + g1OffsetY, bx + x + g1OffsetX);
+                countG1++;
+              }
+              
+              if (by + y + g2OffsetY < height && bx + x + g2OffsetX < width) {
+                sumG2 += srcMat.at<int32_t>(by + y + g2OffsetY, bx + x + g2OffsetX);
+                countG2++;
+              }
+              
+              if (by + y + bOffsetY < height && bx + x + bOffsetX < width) {
+                sumB += srcMat.at<int32_t>(by + y + bOffsetY, bx + x + bOffsetX);
+                countB++;
+              }
+            }
+          }
+          
+          uint32_t newY = by / camybin / 2;
+          uint32_t newX = bx / camxbin / 2;
+          
+          // 添加边界检查，确保不会越界访问
+          if (newY * 2 + rOffsetY < newHeight && newX * 2 + rOffsetX < newWidth && countR > 0)
+            binMat.at<int32_t>(newY * 2 + rOffsetY, newX * 2 + rOffsetX) = sumR / countR;
+          
+          if (newY * 2 + g1OffsetY < newHeight && newX * 2 + g1OffsetX < newWidth && countG1 > 0)
+            binMat.at<int32_t>(newY * 2 + g1OffsetY, newX * 2 + g1OffsetX) = sumG1 / countG1;
+          
+          if (newY * 2 + g2OffsetY < newHeight && newX * 2 + g2OffsetX < newWidth && countG2 > 0)
+            binMat.at<int32_t>(newY * 2 + g2OffsetY, newX * 2 + g2OffsetX) = sumG2 / countG2;
+          
+          if (newY * 2 + bOffsetY < newHeight && newX * 2 + bOffsetX < newWidth && countB > 0)
+            binMat.at<int32_t>(newY * 2 + bOffsetY, newX * 2 + bOffsetX) = sumB / countB;
+        }
+      }
+    }
+  } catch (cv::Exception &e) {
+    Logger::Log("PixelsDataSoftBin_Bayer | 处理图像异常: " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+    binMat.release();  // 释放已分配的内存
+    return cv::Mat();
+  } catch (std::exception &e) {
+    Logger::Log("PixelsDataSoftBin_Bayer | 处理图像标准异常: " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+    binMat.release();  // 释放已分配的内存
+    return cv::Mat();
+  } catch (...) {
+    Logger::Log("PixelsDataSoftBin_Bayer | 处理图像未知异常", LogLevel::ERROR, DeviceType::MAIN);
+    binMat.release();  // 释放已分配的内存
+    return cv::Mat();
+  }
+  newWidth = binMat.cols;
+  newHeight = binMat.rows;
+  if (binMat.cols % 2 != 0) {
+    newWidth = binMat.cols - 1;
+  }
+  if (binMat.rows % 2 != 0) {
+    newHeight = binMat.rows - 1;
+  }
+  // 检查新图像尺寸是否为0
+  if (newWidth == 0 || newHeight == 0) {
+    Logger::Log("PixelsDataSoftBin_Bayer | 错误: 缩放后尺寸为0! " + std::to_string(newWidth) + "x" + std::to_string(newHeight), 
+                LogLevel::ERROR, DeviceType::MAIN);
+    binMat.release();  // 释放已分配的内存
+    return cv::Mat();
+  }
+  
+  // 创建输出图像
+  cv::Mat newbinMat;
+  try {
+    if (binMat.type() == CV_8U) {
+      newbinMat = cv::Mat::zeros(newHeight, newWidth, CV_8U);
+    } else if (binMat.type() == CV_16U) {
+      newbinMat = cv::Mat::zeros(newHeight, newWidth, CV_16U);
+    } else if (binMat.type() == CV_32S) {
+      newbinMat = cv::Mat::zeros(newHeight, newWidth, CV_32S);
+    }
+    Logger::Log("PixelsDataSoftBin_Bayer | 输出图像创建成功", LogLevel::INFO, DeviceType::MAIN);
+
+    // 复制数据
+    if (binMat.cols != newbinMat.cols || binMat.rows != newbinMat.rows) {
+      // 需要调整大小，复制有效区域
+      try {
+        cv::Rect roi(0, 0, newWidth, newHeight);
+        binMat(roi).copyTo(newbinMat);
+        Logger::Log("PixelsDataSoftBin_Bayer | 图像数据裁剪并复制成功", LogLevel::INFO, DeviceType::MAIN);
+      } catch (cv::Exception &e) {
+        Logger::Log("PixelsDataSoftBin_Bayer | 复制图像数据异常: " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+        binMat.release();  // 释放中间图像
+        newbinMat.release();  // 释放输出图像
+        return cv::Mat();
+      }
+    } else {
+      // 尺寸相同，直接返回binMat
+      newbinMat = binMat.clone();
+      Logger::Log("PixelsDataSoftBin_Bayer | 图像数据直接复制成功", LogLevel::INFO, DeviceType::MAIN);
+    }
+    // 释放中间结果图像内存
+    binMat.release();
+  } catch (cv::Exception &e) {
+    Logger::Log("PixelsDataSoftBin_Bayer | 创建输出图像异常: " + std::string(e.what()), LogLevel::ERROR, DeviceType::MAIN);
+    binMat.release();  // 释放中间图像
+    return cv::Mat();
+  }
+  Logger::Log("PixelsDataSoftBin_Bayer | 完成处理，返回结果图像 " + std::to_string(newbinMat.cols) + "x" + std::to_string(newbinMat.rows), 
+              LogLevel::DEBUG, DeviceType::MAIN);
+  
+  // 因为返回值是一个拷贝，所以不需要担心返回后的内存泄漏
+  return newbinMat;
+}
 uint32_t Tools::PixelsDataSoftBin_AVG(uint8_t *srcdata, uint8_t *bindata, uint32_t width, uint32_t height, uint32_t depth, uint32_t camxbin, uint32_t camybin)
 {
   uint32_t stride = width;
@@ -3084,191 +4515,14 @@ uint32_t Tools::PixelsDataSoftBin_AVG(uint8_t *srcdata, uint8_t *bindata, uint32
   }
   return QHYCCD_ERROR;
 }
-
-// uint32_t Tools::PixelsDataSoftBin(uint8_t *srcdata, uint8_t *bindata, uint32_t width, uint32_t height, uint32_t depth, uint32_t camxbin, uint32_t camybin, bool iscolor)
-// {
-//   if (iscolor)
-//   {
-//     unsigned char *data = NULL;
-//     if (srcdata == bindata)
-//     {
-//       data = new unsigned char[(width * depth / 8 + 3) / 4 * 4 * height];
-//       memcpy(data, srcdata, (width * depth / 8 + 3) / 4 * 4 * height);
-//       srcdata = data;
-//     }
-//     if (depth == 8)
-//     {
-//       memset(bindata, 0, (width / camxbin) * (height / camybin));
-//       for (uint32_t i = 0; i < height / camybin / 2; i++)
-//       {
-//         uint8_t *pd = bindata + width / camxbin * i * 2;
-//         uint8_t *ps = srcdata + width * camxbin * i * 2;
-//         uint8_t *psEnd = ps + width / camxbin * camxbin - 1;
-//         for (; ps < psEnd - 1; ps += camxbin * 2, pd += 2)
-//         {
-//           for (int yi = 1; yi <= camybin; yi++)
-//           {
-//             for (int xi = 1; xi <= camxbin; xi++)
-//             {
-//               uint32_t y00 = LimitByte(pd[0] + ps[2 * (yi - 1) * width + 2 * (xi - 1)]);
-//               uint32_t y01 = LimitByte(pd[1] + ps[2 * (yi - 1) * width + 2 * (xi - 1) + 1]);
-//               uint32_t y10 = LimitByte(pd[width / camxbin + 0] + ps[width * (2 * yi - 1) + 2 * (xi - 1)]);
-//               uint32_t y11 = LimitByte(pd[width / camxbin + 1] + ps[width * (2 * yi - 1) + 2 * xi - 1]);
-//               pd[0] = y00;
-//               pd[1] = y01;
-//               pd[width / camxbin + 0] = y10;
-//               pd[width / camxbin + 1] = y11;
-//             }
-//           }
-//         }
-//       }
-//       return QHYCCD_SUCCESS;
-//     }
-//     else if (depth == 16)
-//     {
-//       memset(bindata, 0, 2 * (width / camxbin) * (height / camybin));
-//       for (uint32_t i = 0; i < height / camybin / 2; i++)
-//       {
-//         uint16_t *pd = (uint16_t *)bindata + width / camxbin * i * 2;
-//         uint16_t *ps = (uint16_t *)srcdata + width * camxbin * i * 2;
-//         uint16_t *psEnd = ps + width / camxbin * camxbin - 1;
-//         for (; ps < psEnd - 1; ps += camxbin * 2, pd += 2)
-//         {
-//           for (int yi = 1; yi <= camybin; yi++)
-//           {
-//             for (int xi = 1; xi <= camxbin; xi++)
-//             {
-//               uint32_t y00 = LimitShort(pd[0] + ps[2 * (yi - 1) * width + 2 * (xi - 1)]);
-//               uint32_t y01 = LimitShort(pd[1] + ps[2 * (yi - 1) * width + 2 * (xi - 1) + 1]);
-//               uint32_t y10 = LimitShort(pd[width / camxbin + 0] + ps[width * (2 * yi - 1) + 2 * (xi - 1)]);
-//               uint32_t y11 = LimitShort(pd[width / camxbin + 1] + ps[width * (2 * yi - 1) + 2 * xi - 1]);
-//               pd[0] = y00;
-//               pd[1] = y01;
-//               pd[width / camxbin + 0] = y10;
-//               pd[width / camxbin + 1] = y11;
-//             }
-//           }
-//         }
-//       }
-//       return QHYCCD_SUCCESS;
-//     }
-//     else if (depth == 32)
-//     {
-//       memset(bindata, 0, 4 * (width / camxbin) * (height / camybin));
-//       for (uint32_t i = 0; i < height / camybin / 2; i++)
-//       {
-//         uint32_t *pd = (uint32_t *)bindata + width / camxbin * i * 2;
-//         uint32_t *ps = (uint32_t *)srcdata + width * camxbin * i * 2;
-//         uint32_t *psEnd = ps + width / camxbin * camxbin - 1;
-//         for (; ps < psEnd - 1; ps += camxbin * 2, pd += 2)
-//         {
-//           for (int yi = 1; yi <= camybin; yi++)
-//           {
-//             for (int xi = 1; xi <= camxbin; xi++)
-//             {
-//               pd[0] += ps[2 * (yi - 1) * width + 2 * (xi - 1)];
-//               pd[1] += ps[2 * (yi - 1) * width + 2 * (xi - 1) + 1];
-//               pd[width / camxbin + 0] += ps[width * (2 * yi - 1) + 2 * (xi - 1)];
-//               pd[width / camxbin + 1] += ps[width * (2 * yi - 1) + 2 * xi - 1];
-//             }
-//           }
-//         }
-//       }
-//       return QHYCCD_SUCCESS;
-//     }
-//     if (data != NULL)
-//     {
-//       delete[] data;
-//     }
-//   }
-//   else
-//   {
-//     uint32_t stride = width;
-//     uint32_t newStride = width / camxbin;
-
-//     if (depth == 8)
-//     {
-//       memset(bindata, 0, newStride * (height / camybin));
-//       for (uint32_t i = 0; i < height / camybin; i++)
-//       {
-//         for (uint32_t v = 0; v < camybin; v++)
-//         {
-//           uint8_t *pd = bindata + newStride * i;
-//           uint8_t *ps = srcdata + stride * (i * camybin + v);
-//           for (uint32_t j = 0; j < width / camxbin; j++)
-//           {
-//             for (uint32_t h = 0; h < camxbin; h++)
-//             {
-//               uint32_t y = LimitByte(*pd + *ps);
-//               *pd = y;
-//               ps++;
-//             }
-//             pd++;
-//           }
-//         }
-//       }
-//       return QHYCCD_SUCCESS;
-//     }
-//     else if (depth == 16)
-//     {
-//       memset(bindata, 0, 2 * newStride * (height / camybin));
-//       for (uint32_t i = 0; i < height / camybin; i++)
-//       {
-//         for (uint32_t v = 0; v < camybin; v++)
-//         {
-//           uint16_t *pd = (uint16_t *)bindata + newStride * i;
-//           uint16_t *ps = (uint16_t *)srcdata + stride * (i * camybin + v);
-//           for (uint32_t j = 0; j < width / camxbin; j++)
-//           {
-//             for (uint32_t h = 0; h < camxbin; h++)
-//             {
-//               uint32_t y = LimitShort(*pd + *ps);
-//               *pd = y;
-//               ps++;
-//             }
-//             pd++;
-//           }
-//         }
-//       }
-//       return QHYCCD_SUCCESS;
-//     }
-//     else if (depth == 32)
-//     {
-//       memset(bindata, 0, 4 * newStride * (height / camybin));
-
-//       for (uint32_t i = 0; i < height / camybin; i++)
-//       {
-//         for (uint32_t v = 0; v < camybin; v++)
-//         {
-//           uint32_t *pd = (uint32_t *)bindata + newStride * i;
-//           uint32_t *ps = (uint32_t *)srcdata + stride * (i * camybin + v);
-//           for (uint32_t j = 0; j < width / camxbin; j++)
-//           {
-//             for (uint32_t h = 0; h < camxbin; h++)
-//             {
-//               uint32_t y = *pd + *ps;
-//               *pd = y;
-//               ps++;
-//             }
-//             pd++;
-//           }
-//         }
-//       }
-//       return QHYCCD_SUCCESS;
-//     }
-//   }
-//   return QHYCCD_ERROR;
-// }
-
 uint32_t Tools::PixelsDataSoftBin(uint8_t *srcdata, uint8_t *bindata, uint32_t width, uint32_t height, uint32_t camchannels, uint32_t depth, uint32_t camxbin, uint32_t camybin, bool iscolor)
 {
-  qDebug("QHYCCD | QHYBASE.CPP | PixelsDataSoftBin | width = %d height = %d camchannels = %d depth = %d camxbin = %d camybin = %d iscolor = %d",
-         width, height, camchannels, depth, camxbin, camybin, iscolor);
+  Logger::Log("QHYCCD | QHYBASE.CPP | PixelsDataSoftBin | width = " + std::to_string(width) + " height = " + std::to_string(height) + " camchannels = " + std::to_string(camchannels) + " depth = " + std::to_string(depth) + " camxbin = " + std::to_string(camxbin) + " camybin = " + std::to_string(camybin) + " iscolor = " + std::to_string(iscolor), LogLevel::INFO, DeviceType::MAIN);
   if (iscolor)
   {
     if (depth == 8 && camchannels == 3)
     {
-      qDebug("depth = 8, camchannels = 3");
+      Logger::Log("depth = 8, camchannels = 3", LogLevel::INFO, DeviceType::MAIN);
       unsigned char *data = NULL;
       if (srcdata == bindata)
       {
@@ -3291,7 +4545,7 @@ uint32_t Tools::PixelsDataSoftBin(uint8_t *srcdata, uint8_t *bindata, uint32_t w
     }
     else if (depth == 16 && camchannels == 3)
     {
-      qDebug("depth = 16, camchannels = 3");
+      Logger::Log("depth = 16, camchannels = 3", LogLevel::INFO, DeviceType::MAIN);
       unsigned char *data = NULL;
       if (srcdata == bindata)
       {
@@ -3299,14 +4553,14 @@ uint32_t Tools::PixelsDataSoftBin(uint8_t *srcdata, uint8_t *bindata, uint32_t w
         memcpy(data, srcdata, 2 * width * height * camchannels);
         srcdata = data;
       }
-      qDebug("memcpy 1");
+      Logger::Log("memcpy 1", LogLevel::INFO, DeviceType::MAIN);
       cv::Mat srcMat(cv::Size(2 * width, height), CV_16UC(camchannels));
       cv::Mat dstMat(cv::Size(2 * width / camxbin, height / camybin), CV_16UC(camchannels));
       memcpy(srcMat.data, srcdata, srcMat.cols * srcMat.rows * srcMat.channels());
-      qDebug("memcpy 2");
+      Logger::Log("memcpy 2", LogLevel::INFO, DeviceType::MAIN);
       cv::resize(srcMat, dstMat, cv::Size(dstMat.cols, dstMat.rows));
       memcpy(bindata, dstMat.data, dstMat.cols * dstMat.rows * dstMat.channels());
-      qDebug("memcpy 3");
+      Logger::Log("memcpy 3", LogLevel::INFO, DeviceType::MAIN);
       srcMat.release();
       dstMat.release();
       if (data != NULL)
@@ -3326,14 +4580,14 @@ uint32_t Tools::PixelsDataSoftBin(uint8_t *srcdata, uint8_t *bindata, uint32_t w
       }
       if (depth == 8) // camchannels = 1
       {
-        qDebug("depth = 8, camchannels = 1");
+        Logger::Log("depth = 8, camchannels = 1", LogLevel::INFO, DeviceType::MAIN);
         memset(bindata, 0, (width / camxbin) * (height / camybin));
         for (uint32_t i = 0; i < height / camybin / 2; i++)
         {
           uint8_t *pd = bindata + width / camxbin * i * 2;
           uint8_t *ps = srcdata + width * camxbin * i * 2;
-          uint8_t *psEnd = ps + width / camxbin * camxbin - 1;
-          for (; ps < psEnd - 1; ps += camxbin * 2, pd += 2)
+          uint8_t *psEnd = ps + width / camxbin * camxbin;
+          for (; ps < psEnd - camxbin * 2+1; ps += camxbin * 2, pd += 2)
           {
             for (int yi = 1; yi <= camybin; yi++)
             {
@@ -3355,15 +4609,15 @@ uint32_t Tools::PixelsDataSoftBin(uint8_t *srcdata, uint8_t *bindata, uint32_t w
       }
       else if (depth == 16) // camchannels = 1
       {
-        qDebug("depth = 16, camchannels = 1");
+        Logger::Log("depth = 16, camchannels = 1", LogLevel::INFO, DeviceType::MAIN);
         memset(bindata, 0, 2 * (width / camxbin) * (height / camybin));
-        qDebug("memcpy 1");
+        Logger::Log("memcpy 1", LogLevel::INFO, DeviceType::MAIN);
         for (uint32_t i = 0; i < height / camybin / 2; i++)
         {
           uint16_t *pd = (uint16_t *)bindata + width / camxbin * i * 2;
           uint16_t *ps = (uint16_t *)srcdata + width * camxbin * i * 2;
-          uint16_t *psEnd = ps + width / camxbin * camxbin - 1;
-          for (; ps < psEnd - camxbin * 2; ps += camxbin * 2, pd += 2)
+          uint16_t *psEnd = ps + width / camxbin * camxbin;
+          for (; ps < psEnd - camxbin * 2+1; ps += camxbin * 2, pd += 2)
           {
             for (int yi = 1; yi <= camybin; yi++)
             {
@@ -3385,7 +4639,7 @@ uint32_t Tools::PixelsDataSoftBin(uint8_t *srcdata, uint8_t *bindata, uint32_t w
       }
       else if (depth == 32) // camchannels = 1
       {
-        qDebug("depth = 32, camchannels = 1");
+        Logger::Log("depth = 32, camchannels = 1", LogLevel::INFO, DeviceType::MAIN);
         memset(bindata, 0, 4 * (width / camxbin) * (height / camybin));
         for (uint32_t i = 0; i < height / camybin / 2; i++)
         {
@@ -3497,12 +4751,12 @@ void Tools::SaveMatTo8BitJPG(cv::Mat image)
 {
   if (image.empty())
   {
-    std::cerr << "输入图像为空，无法保存！" << std::endl;
+    Logger::Log("输入图像为空，无法保存！", LogLevel::ERROR, DeviceType::MAIN);
     return;
   }
 
   // 打印输入图像的信息
-  std::cout << "Input image type: " << image.type() << ", size: " << image.size() << std::endl;
+  Logger::Log("Input image type: " + std::to_string(image.type()) + ", size: " + std::to_string(image.size().width) + "x" + std::to_string(image.size().height), LogLevel::INFO, DeviceType::MAIN);
 
   cv::Mat image16;
   cv::Mat SendImage;
@@ -3510,45 +4764,45 @@ void Tools::SaveMatTo8BitJPG(cv::Mat image)
   // 确保输入图像是8位深度
   if (image.depth() == CV_8U)
   {
-    qDebug("256, 0");
+    Logger::Log("256, 0", LogLevel::INFO, DeviceType::MAIN);
     image.convertTo(image16, CV_16UC1, 256, 0); // x256  MSB alignment
   }
   else if (image.depth() == CV_16U)
   {
-    qDebug("1, 0");
+    Logger::Log("1, 0", LogLevel::INFO, DeviceType::MAIN);
     image.convertTo(image16, CV_16UC1, 1, 0);
   }
   else
   {
-    std::cerr << "Unsupported image depth: " << image.depth() << std::endl;
+    Logger::Log("Unsupported image depth: " + std::to_string(image.depth()), LogLevel::ERROR, DeviceType::MAIN);
     return;
   }
 
   // 打印转换后图像的信息
-  std::cout << "Converted image type: " << image16.type() << ", size: " << image16.size() << std::endl;
+  Logger::Log("Converted image type: " + std::to_string(image16.type()) + ", size: " + std::to_string(image16.size().width) + "x" + std::to_string(image16.size().height), LogLevel::INFO, DeviceType::MAIN);
 
   cv::Mat NewImage = image16;
 
   // 打印新图像的信息
-  std::cout << "New image type: " << NewImage.type() << ", size: " << NewImage.size() << std::endl;
+  Logger::Log("New image type: " + std::to_string(NewImage.type()) + ", size: " + std::to_string(NewImage.size().width) + "x" + std::to_string(NewImage.size().height), LogLevel::INFO, DeviceType::MAIN);
 
   // 将图像缩放到0-255范围内
   cv::normalize(NewImage, SendImage, 0, 255, cv::NORM_MINMAX, CV_8U);
   // cv::convertScaleAbs(NewImage, SendImage, 1 / 256.0);
 
   // 打印最终图像的信息
-  std::cout << "SendImage type: " << SendImage.type() << ", size: " << SendImage.size() << std::endl;
+  Logger::Log("SendImage type: " + std::to_string(SendImage.type()) + ", size: " + std::to_string(SendImage.size().width) + "x" + std::to_string(SendImage.size().height), LogLevel::INFO, DeviceType::MAIN);
 
   std::string outputFilename = "/dev/shm/MatTo8BitJPG.jpg";
   bool saved = cv::imwrite(outputFilename, SendImage);
 
   if (!saved)
   {
-    std::cerr << "图像保存失败！" << std::endl;
+    Logger::Log("图像保存失败！", LogLevel::ERROR, DeviceType::MAIN);
   }
   else
   {
-    std::cout << "图像已成功保存到: " << outputFilename << std::endl;
+    Logger::Log("图像已成功保存到: " + outputFilename, LogLevel::INFO, DeviceType::MAIN);
   }
 }
 
@@ -3556,19 +4810,19 @@ void Tools::SaveMatTo16BitPNG(cv::Mat image)
 {
     if (image.empty())
     {
-        std::cerr << "输入图像为空，无法保存！" << std::endl;
+        Logger::Log("输入图像为空，无法保存！", LogLevel::ERROR, DeviceType::MAIN);
         return;
     }
 
     // 打印输入图像的信息
-    std::cout << "Input image type: " << image.type() << ", size: " << image.size() << std::endl;
+    Logger::Log("Input image type: " + std::to_string(image.type()) + ", size: " + std::to_string(image.size().width) + "x" + std::to_string(image.size().height), LogLevel::INFO, DeviceType::MAIN);
 
     cv::Mat image16;
 
     // 如果输入图像是 8 位深度，将其转换为 16 位深度
     if (image.depth() == CV_8U)
     {
-        std::cout << "将 8 位图像转换为 16 位..." << std::endl;
+        Logger::Log("将 8 位图像转换为 16 位...", LogLevel::INFO, DeviceType::MAIN);
         image.convertTo(image16, CV_16U, 256.0); // 将8位深度转换为16位深度，x256以扩展范围
     }
     else if (image.depth() == CV_16U)
@@ -3578,29 +4832,29 @@ void Tools::SaveMatTo16BitPNG(cv::Mat image)
     }
     else
     {
-        std::cerr << "Unsupported image depth: " << image.depth() << std::endl;
+        Logger::Log("Unsupported image depth: " + std::to_string(image.depth()), LogLevel::ERROR, DeviceType::MAIN);
         return;
     }
 
     // 打印转换后图像的信息
-    std::cout << "Converted image type: " << image16.type() << ", size: " << image16.size() << std::endl;
+    Logger::Log("Converted image type: " + std::to_string(image16.type()) + ", size: " + std::to_string(image16.size().width) + "x" + std::to_string(image16.size().height), LogLevel::INFO, DeviceType::MAIN);
 
     std::string outputFilename = "/dev/shm/MatTo16BitPNG.png";
     bool saved = cv::imwrite(outputFilename, image16); // 使用 PNG 格式保存
 
     if (!saved)
     {
-        std::cerr << "图像保存失败！" << std::endl;
+        Logger::Log("图像保存失败！", LogLevel::ERROR, DeviceType::MAIN);
     }
     else
     {
-        std::cout << "图像已成功保存到: " << outputFilename << std::endl;
+        Logger::Log("图像已成功保存到: " + outputFilename, LogLevel::INFO, DeviceType::MAIN);
     }
 }
 
 void Tools::SaveMatToFITS(const cv::Mat& image) {
     if (image.empty()) {
-        std::cerr << "输入图像为空！" << std::endl;
+        Logger::Log("输入图像为空！", LogLevel::ERROR, DeviceType::MAIN);
         return;
     }
 
@@ -3612,9 +4866,22 @@ void Tools::SaveMatToFITS(const cv::Mat& image) {
         gray = image;
     }
 
+    // 根据图像类型动态设置 bitpix 和数据类型
+    int bitpix;
+    int datatype;
+    if (gray.depth() == CV_8U) {
+        bitpix = BYTE_IMG;   // 8 位无符号整型
+        datatype = TBYTE;
+    } else if (gray.depth() == CV_16U) {
+        bitpix = SHORT_IMG;  // 16 位无符号整型
+        datatype = TSHORT;
+    } else {
+        Logger::Log("不支持的图像位深度！", LogLevel::ERROR, DeviceType::MAIN);
+        return;
+    }
+
     // FITS文件要求图像数据是二维的
     long naxes[2] = {gray.cols, gray.rows};
-    int bitpix = SHORT_IMG;  // 使用16位整型保存
 
     // 创建FITS文件，使用 '!' 来覆盖已存在的文件
     fitsfile* fptr;
@@ -3624,7 +4891,11 @@ void Tools::SaveMatToFITS(const cv::Mat& image) {
     fits_create_img(fptr, bitpix, 2, naxes, &status);
 
     // 将图像数据写入FITS文件
-    fits_write_img(fptr, TSHORT, 1, gray.total(), gray.ptr<short>(), &status);
+    if (gray.depth() == CV_8U) {
+        fits_write_img(fptr, datatype, 1, gray.total(), gray.ptr<uchar>(), &status);
+    } else if (gray.depth() == CV_16U) {
+        fits_write_img(fptr, datatype, 1, gray.total(), gray.ptr<ushort>(), &status);
+    }
 
     // 关闭FITS文件
     fits_close_file(fptr, &status);
@@ -3632,7 +4903,7 @@ void Tools::SaveMatToFITS(const cv::Mat& image) {
     if (status) {
         fits_report_error(stderr, status);  // 输出错误信息
     } else {
-        std::cout << "成功保存图像到 " << filename << std::endl;
+        Logger::Log("成功保存图像到 " + filename, LogLevel::INFO, DeviceType::MAIN);
     }
 }
 
@@ -3679,9 +4950,8 @@ double Tools::getLST_Degree(QDateTime datetimeUTC, double longitude_radian) {
   int msec = datetimeUTC.time().msec();
 
 #ifdef debug
-  qDebug() << "tools.cpp|getLST_Degree|datetimeUTC:" << datetimeUTC;
-  qDebug() << "tools.cpp|getLST_Degree|datetimeUTC:" << year << month << day
-           << hour << minute << second << msec;
+  Logger::Log("tools.cpp|getLST_Degree|datetimeUTC:" + datetimeUTC.toString("yyyy-MM-dd HH:mm:ss.zzz"), LogLevel::INFO, DeviceType::MAIN);
+  Logger::Log("tools.cpp|getLST_Degree|datetimeUTC:" + std::to_string(year) + "-" + std::to_string(month) + "-" + std::to_string(day) + " " + std::to_string(hour) + ":" + std::to_string(minute) + ":" + std::to_string(second) + "." + std::to_string(msec), LogLevel::INFO, DeviceType::MAIN);
 #endif
 
   double jd;
@@ -3691,7 +4961,7 @@ double Tools::getLST_Degree(QDateTime datetimeUTC, double longitude_radian) {
   d = jd - 2451545.0;
 
 #ifdef debug
-  qDebug("tools.cpp|getLST_Degree|d = %f", d);
+  Logger::Log("tools.cpp|getLST_Degree|d = " + std::to_string(d), LogLevel::INFO, DeviceType::MAIN);
 #endif
 
   double UT;
@@ -3699,13 +4969,13 @@ double Tools::getLST_Degree(QDateTime datetimeUTC, double longitude_radian) {
   UT = hour + (minute * 60 + second + (double)msec / 1000) / 3600.0;
 
 #ifdef debug
-  qDebug("tools.cpp|getLST_Degree|UT = %f", UT);
+  Logger::Log("tools.cpp|getLST_Degree|UT = " + std::to_string(UT), LogLevel::INFO, DeviceType::MAIN);
 #endif
 
   double longitude_Degree = RadToDegree(longitude_radian);
 
 #ifdef debug
-  qDebug("tools.cpp|getLST_Degree|longitude (degree) = %f", longitude_Degree);
+  Logger::Log("tools.cpp|getLST_Degree|longitude (degree) = " + std::to_string(longitude_Degree), LogLevel::INFO, DeviceType::MAIN);
 #endif
 
   double LST;
@@ -3713,19 +4983,17 @@ double Tools::getLST_Degree(QDateTime datetimeUTC, double longitude_radian) {
   LST = 100.46 + 0.985647 * d + longitude_Degree + 15 * UT;
 
 #ifdef debug
-  qDebug("tools.cpp|getLST_Degree|LST before range = %f", LST);
+  Logger::Log("tools.cpp|getLST_Degree|LST before range = " + std::to_string(LST), LogLevel::INFO, DeviceType::MAIN);
 #endif
 
   LST = rangeTo(LST, 360.0, 0.0);
 
 #ifdef debug
-  qDebug("tools.cpp|getLST_Degree|LST after  range (degree) %f (hms) %s", LST,
-         qPrintable(radToHmsStr(DegreeToRad(LST), true)));
+  Logger::Log("tools.cpp|getLST_Degree|LST after  range (degree) " + std::to_string(LST) + " (hms) " + radToHmsStr(DegreeToRad(LST), true), LogLevel::INFO, DeviceType::MAIN);
 #endif
 
   return LST;
 }
-
 bool Tools::getJDFromDate(double *newjd, const int y, const int m, const int d, const int h, const int min, const float s)
 {
     static const long IGREG2 = 15 + 31L * (10 + 12L * 1582);
@@ -3796,8 +5064,7 @@ double Tools::getHA_Degree(double RA_radian, double LST_Degree) {
   HA = rangeTo(HA, 360.0, 0.0);
 
 #ifdef debug
-  qDebug("tools.cpp|getHA|HA (degree) %f (hms) %s", HA,
-         qPrintable(radToHmsStr(DegreeToRad(HA), true)));
+  Logger::Log("tools.cpp|getHA|HA (degree) " + std::to_string(HA) + " (hms) " + radToHmsStr(DegreeToRad(HA), true), LogLevel::INFO, DeviceType::MAIN);
 #endif
 
   return HA;
@@ -3824,12 +5091,8 @@ void Tools::ra_dec_to_alt_az(double ha_radian, double dec_radian,
       az_radian = temp;
   }
 #ifdef debug
-  qDebug("tools.cpp|ra_dec_to_alt_az|az alt (radian):%f %f (Degree) %f %f",
-         az_radian, alt_radian, RadToDegree(az_radian),
-         RadToDegree(alt_radian));
-  qDebug("tools.cpp|ra_dec_to_alt_az|az alt (dms):%s %s",
-         qPrintable(radToDmsStr(az_radian)),
-         qPrintable(radToDmsStr(alt_radian)));
+  Logger::Log("tools.cpp|ra_dec_to_alt_az|az alt (radian):" + std::to_string(az_radian) + " " + std::to_string(alt_radian) + " (Degree) " + std::to_string(RadToDegree(az_radian)) + " " + std::to_string(RadToDegree(alt_radian)), LogLevel::INFO, DeviceType::MAIN);
+  Logger::Log("tools.cpp|ra_dec_to_alt_az|az alt (dms):" + radToDmsStr(az_radian) + " " + radToDmsStr(alt_radian), LogLevel::INFO, DeviceType::MAIN);
 #endif
 }
 
@@ -3843,7 +5106,6 @@ void Tools::full_ra_dec_to_alt_az(QDateTime datetimeUTC, double ra_radian,
   ra_dec_to_alt_az(DegreeToRad(HA_Degree), dec_radian, alt_radian, az_radian,
                    latitude_radian);
 }
-
 void Tools::alt_az_to_ra_dec(double alt_radian, double az_radian,
                              double& hr_radian, double& dec_radian,
                              double lat_radian) {
@@ -4203,26 +5465,54 @@ SphericalCoordinates Tools::convertToSphericalCoordinates(CartesianCoordinates c
     return {rightAscension, declination};
 }
 
-MinMaxFOV Tools::calculateFOV(int FocalLength,double CameraSize_width,double CameraSize_height)
-{
-  MinMaxFOV result;
-  qDebug() << "FocalLength: " << FocalLength << ", " << "CameraSize: " << CameraSize_width << ", " << CameraSize_height;
+// MinMaxFOV Tools::calculateFOV(int FocalLength,double CameraSize_width,double CameraSize_height)
+// {
+//   MinMaxFOV result;
+//   Logger::Log("FocalLength: " + std::to_string(FocalLength) + ", " + "CameraSize: " + std::to_string(CameraSize_width) + ", " + std::to_string(CameraSize_height), LogLevel::INFO, DeviceType::MAIN);
 
-  double CameraSize_diagonal = sqrt(pow(CameraSize_width, 2) + pow(CameraSize_height, 2));
-  // qDebug() << CameraSize_diagonal;
+//   double CameraSize_diagonal = sqrt(pow(CameraSize_width, 2) + pow(CameraSize_height, 2));
+//   // qDebug() << CameraSize_diagonal;
 
-  double minFOV,maxFOV;
+//   double minFOV,maxFOV;
 
-  minFOV = 2 * atan(CameraSize_height / (2 * FocalLength)) * 180 / M_PI;
-  maxFOV = 2 * atan(CameraSize_diagonal / (2 * FocalLength)) * 180 / M_PI;
+//   minFOV = 2 * atan(CameraSize_height / (2 * FocalLength)) * 180 / M_PI;
+//   maxFOV = 2 * atan(CameraSize_diagonal / (2 * FocalLength)) * 180 / M_PI;
 
-  result.minFOV = minFOV;
-  result.maxFOV = maxFOV;
+//   result.minFOV = minFOV;
+//   result.maxFOV = maxFOV;
   
-  qDebug() << "minFov: " << result.minFOV << ", " << "maxFov: " << result.maxFOV;
+//   Logger::Log("minFov: " + std::to_string(result.minFOV) + ", " + "maxFov: " + std::to_string(result.maxFOV), LogLevel::INFO, DeviceType::MAIN);
 
-  return result;
+//   return result;
+// }
+
+MinMaxFOV Tools::calculateFOV(int FocalLength, double CameraSize_width, double CameraSize_height)
+{
+    MinMaxFOV result;
+    Logger::Log("FocalLength: " + std::to_string(FocalLength) +
+                ", CameraSize: " + std::to_string(CameraSize_width) +
+                " x " + std::to_string(CameraSize_height),
+                LogLevel::INFO, DeviceType::MAIN);
+
+    // 对角线
+    double CameraSize_diagonal = std::hypot(CameraSize_width, CameraSize_height);
+
+    // 取宽高里的较小者
+    double min_side = std::min(CameraSize_width, CameraSize_height);
+
+    double minFOV = 2.0 * atan(min_side / (2.0 * FocalLength)) * 180.0 / M_PI;
+    double maxFOV = 2.0 * atan(CameraSize_diagonal / (2.0 * FocalLength)) * 180.0 / M_PI;
+
+    result.minFOV = minFOV;   // 最小视场（短边方向）
+    result.maxFOV = maxFOV;   // 最大视场（对角线方向）
+
+    Logger::Log("minFOV: " + std::to_string(result.minFOV) +
+                ", maxFOV: " + std::to_string(result.maxFOV),
+                LogLevel::INFO, DeviceType::MAIN);
+
+    return result;
 }
+
 
 // 计算格林尼治恒星时 (GST)
 double Tools::calculateGST(const std::tm& date) {
@@ -4283,6 +5573,7 @@ double Tools::DMSToDegree(int degrees, int minutes, double seconds) {
 
 bool Tools::WaitForPlateSolveToComplete() {
   // qDebug() << "Wait For Plate Solve To Complete.";
+  Logger::Log("Wait For Plate Solve(" + std::to_string(!PlateSolveInProgress) + ") To Complete...", LogLevel::INFO, DeviceType::MAIN);
   return !PlateSolveInProgress;
 }
 
@@ -4290,124 +5581,251 @@ bool Tools::isSolveImageFinish() {
   return isSolveImageFinished;
 }
 
-SloveResults Tools::PlateSolve(QString filename, int FocalLength,double CameraSize_width,double CameraSize_height, bool USEQHYCCDSDK)
-{
-  PlateSolveInProgress = true;
-  isSolveImageFinished = false;
-
-  SloveResults result;
-  MinMaxFOV FOV;
-
-  FOV = calculateFOV(FocalLength, CameraSize_width, CameraSize_height);
-
-  QString MinFOV = QString::number(FOV.minFOV);
-  QString MaxFOV = QString::number(FOV.maxFOV);
-
-  // solve image
-  QProcess* cmd_test = new QProcess();
-  QObject::connect(cmd_test, SIGNAL(finished(int)), instance_, SLOT(onSolveFinished(int)));
-
-  QString command_qstr;
-  // QString filename;
-  if(USEQHYCCDSDK == false)
-  {
-    // filename = "/dev/shm/ccd_simulator";
-    // command_qstr="solve-field " + filename + ".fits" + " --overwrite --scale-units degwidth --scale-low " + MinFOV + " --scale-high " + MaxFOV + " --ra " + RA + " --dec " + DEC + " --radius 10 --nsigma 12  --no-plots  --no-remove-lines --uniformize 0 --timestamp";
-    command_qstr="solve-field " + filename + " --overwrite --cpulimit 5 --scale-units degwidth --scale-low " + MinFOV + " --scale-high " + MaxFOV + " --nsigma 8  --no-plots  --no-remove-lines --uniformize 0 --timestamp";
-  }
-  else
-  {
-    filename = "/dev/shm/SDK_Capture";
-    // command_qstr="solve-field " + filename + ".png"  + " --overwrite --scale-units degwidth --scale-low " + MinFOV + " --scale-high " + MaxFOV + " --ra " + RA + " --dec " + DEC + " --radius 10 --nsigma 12  --no-plots  --no-remove-lines --uniformize 0 --timestamp";
-  }
-
-  const char* command;
-  command = command_qstr.toLocal8Bit();
-  qDebug() << command;  // TODO:注释掉
-
-  cmd_test->start(command);
-  cmd_test->waitForStarted();
-  cmd_test->waitForFinished();
-
-  QApplication::processEvents();
+bool Tools::isPlateSolveInProgress() {
+  return PlateSolveInProgress;
 }
+bool Tools::PlateSolve(QString filename, int FocalLength, double CameraSize_width, double CameraSize_height, bool USEQHYCCDSDK, int mode, double lastRA, double lastDEC)
+{
+    // 参数说明：
+    // mode: 0=基础模式, 1=包含视场参数, 2=包含视场和位置参数
+    // lastRA: 上次解析的赤经，单位为度 (0-360°)，注意不是小时制
+    // lastDEC: 上次解析的赤纬，单位为度 (-90° to +90°)
+    // 
+    // 智能回退策略：
+    // - 模式2缺少位置参数但有视场参数 → 回退到模式1
+    // - 模式2缺少视场参数 → 回退到模式0  
+    // - 模式1缺少视场参数 → 回退到模式0
+    
+    // filename = "/home/quarcs/workspace/testimage/0.fits";
+    PlateSolveInProgress = true;
+    isSolveImageFinished = false;
+    mode = 0; // TODO:测试模式,使用模式1
 
+    MinMaxFOV FOV = calculateFOV(FocalLength, CameraSize_width, CameraSize_height);
+
+    QString MinFOV = QString::number(FOV.minFOV);
+    QString MaxFOV = QString::number(FOV.maxFOV);
+
+    QProcess* cmd_test = new QProcess();
+    // 设置父对象为 instance_，确保在 instance_ 销毁时自动释放
+    cmd_test->setParent(instance_);
+    QObject::connect(cmd_test, SIGNAL(finished(int)), instance_, SLOT(onSolveFinished(int)));
+    // 连接 finished 信号以自动释放 QProcess（消除重载歧义）
+    QObject::connect(cmd_test,
+                     QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                     cmd_test, &QObject::deleteLater);
+
+    // 连接输出和错误信号以实时处理输出
+    // 移除static关键字，每次调用都使用新的变量
+    QString lastOutput; // 上一次的输出内容
+    int repeatCount = 0; // 重复次数
+
+    QObject::connect(cmd_test, &QProcess::readyReadStandardOutput, [cmd_test, &lastOutput, &repeatCount]() {
+        QString buffer;  // 移除static，每次都是新的缓冲区
+        buffer += cmd_test->readAllStandardOutput();  // 累加新的输出到缓冲区
+
+        int newlineIndex;
+        while ((newlineIndex = buffer.indexOf('\n')) != -1) {  // 检查是否有新行
+            QString output = buffer.left(newlineIndex).trimmed();  // 获取一行输出
+            buffer.remove(0, newlineIndex + 1);  // 从缓冲区移除这一行
+
+            // 下面是原有的处理逻辑
+            if (output == lastOutput) {
+                repeatCount++;
+                if (repeatCount >= 10) {
+                    Logger::Log("当前解析进度:" + output.toStdString(), LogLevel::INFO, DeviceType::MAIN);
+                    emit instance_->parseInfoEmitted(output);
+                    repeatCount = 0;
+                }
+            } else {
+                lastOutput = output;
+                repeatCount = 1;
+                Logger::Log("当前解析进度:" + output.toStdString(), LogLevel::INFO, DeviceType::MAIN);
+                emit instance_->parseInfoEmitted(output);
+            }
+        }
+    });
+
+    QString command_qstr;
+    if (!USEQHYCCDSDK)
+    {
+        // 根据模式选择不同的命令构建逻辑
+        int actualMode = mode; // 实际使用的模式，可能会根据参数可用性回退
+        
+        if (mode == 1) {
+            // 模式1：加入视场参数，如果视场参数无效则回退到模式0
+            if (FocalLength <= 0 || CameraSize_width <= 0 || CameraSize_height <= 0 || FOV.minFOV <= 0 || FOV.maxFOV <= 0) {
+                Logger::Log("模式1参数不完整，回退到模式0", LogLevel::WARNING, DeviceType::MAIN);
+                actualMode = 0;
+            }
+        } else if (mode == 2) {
+            // 模式2：智能回退逻辑
+            bool hasValidFOV = (FocalLength > 0 && CameraSize_width > 0 && CameraSize_height > 0 && FOV.minFOV > 0 && FOV.maxFOV > 0);
+            bool hasValidPosition = (lastRA != 0.0 && lastDEC != 0.0);
+            
+            if (!hasValidPosition && !hasValidFOV) {
+                // 位置参数和视场参数都无效，回退到模式0
+                Logger::Log("模式2位置和视场参数都不完整，回退到模式0", LogLevel::WARNING, DeviceType::MAIN);
+                actualMode = 0;
+            } else if (!hasValidPosition) {
+                // 位置参数无效但视场参数有效，回退到模式1
+                Logger::Log("模式2位置参数不完整，回退到模式1（保留视场参数）", LogLevel::WARNING, DeviceType::MAIN);
+                actualMode = 1;
+            } else if (!hasValidFOV) {
+                // 视场参数无效但位置参数有效，也回退到模式0（因为模式2需要视场+位置）
+                Logger::Log("模式2视场参数不完整，回退到模式0", LogLevel::WARNING, DeviceType::MAIN);
+                actualMode = 0;
+            }
+            // 如果两个参数都有效，actualMode保持为2
+        }
+        
+        // 根据实际模式构建命令
+        switch (actualMode) {
+            case 1:
+                // 模式1：基础命令 + 视场参数
+                command_qstr = "solve-field " + filename + " --overwrite --no-plots --uniformize 0 --timestamp --pixel-error 1.5 --cpulimit 20 --scale-units degwidth --scale-low " + MinFOV + " --scale-high " + MaxFOV;
+                Logger::Log("使用模式1解析（包含视场参数）", LogLevel::INFO, DeviceType::MAIN);
+                break;
+            case 2:
+                // 模式2：基础命令 + 视场参数 + RA/DEC参数
+                // --radius 5 表示在指定RA/DEC周围5度半径的圆形区域内搜索
+                // 注意：solve-field的--ra参数接受度制或hh:mm:ss格式，--dec接受度制或[+-]dd:mm:ss格式
+                command_qstr = "solve-field " + filename + " --overwrite --no-plots --uniformize 0 --timestamp --pixel-error 1.5 --cpulimit 20 --scale-units degwidth --scale-low " + MinFOV + " --scale-high " + MaxFOV + " --ra " + QString::number(lastRA, 'f', 6) + " --dec " + QString::number(lastDEC, 'f', 6) + " --radius 5";
+                Logger::Log("使用模式2解析（包含视场和位置参数）", LogLevel::INFO, DeviceType::MAIN);
+                break;
+            case 0:
+            default:
+                // 模式0：默认命令（原有逻辑）
+                command_qstr = "solve-field " + filename + " --overwrite --no-plots --uniformize 0 --timestamp --pixel-error 1.5 --cpulimit 20";
+                Logger::Log("使用模式0解析（默认模式）", LogLevel::INFO, DeviceType::MAIN);
+                break;
+        }
+    }
+    else
+    {
+        filename = "/dev/shm/SDK_Capture";
+        // TODO: 根据模式调整QHYCCDSDK的命令（如果需要）
+    }
+    
+    Logger::Log("当前解析命令:" + command_qstr.toStdString(), LogLevel::INFO, DeviceType::MAIN);
+    cmd_test->start(command_qstr);
+    
+    if (!cmd_test->waitForStarted()) {
+        Logger::Log("解析命令启动失败", LogLevel::ERROR, DeviceType::MAIN);
+        PlateSolveInProgress = false;
+        isSolveImageFinished = false;
+        return false;
+    }
+    
+    // 设置更长的超时时间，适应树莓派的性能
+    if (!cmd_test->waitForFinished(300000)) { // 5分钟超时
+        Logger::Log("解析命令执行超时，强制终止", LogLevel::WARNING, DeviceType::MAIN);
+        cmd_test->kill(); // 强制终止进程
+        PlateSolveInProgress = false;
+        isSolveImageFinished = false;
+        return false;
+    }
+    
+    // 检查进程退出状态
+    int exitCode = cmd_test->exitCode();
+    if (exitCode != 0) {
+        Logger::Log("解析命令执行失败，退出码: " + std::to_string(exitCode), LogLevel::ERROR, DeviceType::MAIN);
+        PlateSolveInProgress = false;
+        isSolveImageFinished = false;
+        return false;
+    }
+
+    QApplication::processEvents();
+
+    return true;
+}
 SloveResults Tools::ReadSolveResult(QString filename, int imageWidth, int imageHeight) {
   isSolveImageFinished = false;
+  sleep(1);
 
   SloveResults result;
-  filename = filename.chopped(5);
+  filename = filename.chopped(5);  // 移除文件名的最后五个字符
 
-  QString command_qstr;
-  command_qstr = "wcsinfo " + filename + ".wcs";
-  const char* command;
-  command = command_qstr.toLocal8Bit();
-  qDebug() << command;  // TODO:娉ㄩ噴鎺?  
   QProcess* cmd_test = new QProcess();
+  // cmd_test->start("wcsinfo /dev/shm/Capture_00003_bin.wcs");  // 启动外部程序来读取WCS信息
+  cmd_test->start("wcsinfo " + filename + ".wcs");
+  cmd_test->waitForFinished();  // 等待外部程序执行完成
 
-  cmd_test->start(command);
-  cmd_test->waitForStarted();
-  cmd_test->waitForFinished();
+  QString str = cmd_test->readAllStandardOutput();  // 读取程序输出的结果
+  
+  // 释放 QProcess 内存，避免内存泄漏
+  cmd_test->deleteLater();
 
-  QString str;
-  str = cmd_test->readAllStandardOutput().data();
-
-  qDebug("%s", qPrintable(str));
-
-  int pos1 = str.indexOf("ra_center");
-  int pos2 = str.indexOf("dec_center");
-  int pos3 = str.indexOf("orientation_center");
-  int pos4 = str.indexOf("ra_center_h");
-  qDebug("pos 1 2 3 4: %d %d %d %d", pos1, pos2, pos3, pos4);
-
-  QString str_RA_Degree, str_DEC_Degree, str_Rotation;
-
-  str_RA_Degree = str.mid(pos1 + 10, pos2 - pos1 - 10 - 1);
-  str_DEC_Degree = str.mid(pos2 + 11, pos3 - pos2 - 11 - 1);
-  str_Rotation = str.mid(pos3 + 19, pos4 - pos3 - 19 - 1);
-
-  double RA_Degree, DEC_Degree, Rotation_Degree;
-  RA_Degree = str_RA_Degree.toDouble();
-  DEC_Degree = str_DEC_Degree.toDouble();
-  Rotation_Degree = str_Rotation.toDouble();
-
-  WCSParams wcs = extractWCSParams(str);
-  std::vector<SphericalCoordinates> corners = getFOVCorners(wcs, imageWidth, imageHeight);
-  std::cout << "FOV Corners (Ra, Dec):" << std::endl;
-  for (const auto &corner : corners)
-  {
-    std::cout << "Ra: " << corner.ra << ", Dec: " << corner.dec << std::endl;
-  }
-  result.RA_0 = corners[0].ra;
-  result.DEC_0 = corners[0].dec;
-  result.RA_1 = corners[1].ra;
-  result.DEC_1 = corners[1].dec;
-  result.RA_2 = corners[2].ra;
-  result.DEC_2 = corners[2].dec;
-  result.RA_3 = corners[3].ra;
-  result.DEC_3 = corners[3].dec;
-
-  qDebug("RA DEC Rotation(degree) %f %f %f", RA_Degree, DEC_Degree, Rotation_Degree);
-  if (str == "") {
-    qDebug("Tools:Plate Solve Failur");
+  if (str.isEmpty()) {
+    Logger::Log("wcsinfo 输出为空，解析失败", LogLevel::ERROR, DeviceType::MAIN);
     result.RA_Degree = -1;
     result.DEC_Degree = -1;
     PlateSolveInProgress = false;
     return result;
-  } else {
-    qDebug() << "RA DEC " << QString::number(RA_Degree, 'g', 9) << " " << QString::number(DEC_Degree, 'g', 9);
-    result.RA_Degree = RA_Degree;
-    result.DEC_Degree = DEC_Degree;
+  }
+
+  // Logger::Log("wcsinfo: " + str.toStdString(), LogLevel::INFO, DeviceType::MAIN);
+
+  // 查找关键信息的位置
+  int pos1 = str.indexOf("ra_center");
+  int pos2 = str.indexOf("dec_center");
+  int pos3 = str.indexOf("orientation_center");
+  int pos4 = str.indexOf("ra_center_h");
+  if (pos1 == -1 || pos2 == -1 || pos3 == -1 || pos4 == -1) {
+    Logger::Log("无法在wcsinfo输出中找到必要的关键字", LogLevel::ERROR, DeviceType::MAIN);
+    result.RA_Degree = -1;
+    result.DEC_Degree = -1;
     PlateSolveInProgress = false;
     return result;
   }
-}
+  Logger::Log("pos 1 2 3 4: " + std::to_string(pos1) + " " + std::to_string(pos2) + " " + std::to_string(pos3) + " " + std::to_string(pos4), LogLevel::INFO, DeviceType::MAIN);
 
+  // 提取并转换坐标信息
+  QString str_RA_Degree = str.mid(pos1 + 10, pos2 - pos1 - 10 - 1);
+  QString str_DEC_Degree = str.mid(pos2 + 11, pos3 - pos2 - 11 - 1);
+  QString str_Rotation = str.mid(pos3 + 19, pos4 - pos3 - 19 - 1);
+
+  double RA_Degree = str_RA_Degree.toDouble();
+  double DEC_Degree = str_DEC_Degree.toDouble();
+  double Rotation_Degree = str_Rotation.toDouble();
+
+  // 提取视场信息（包含 fieldw/fieldh、ramin/ramax 等）
+  FieldOfView fov = extractFieldOfViewFromWcsInfo(str);
+
+
+  bool ok0 = false, ok1 = false, ok2 = false, ok3 = false;
+  QString wcsPath = filename + ".wcs";
+  SphericalCoordinates c0 = xy2rdByExternal(wcsPath, 0, 0, ok0);
+  SphericalCoordinates c1 = xy2rdByExternal(wcsPath, fov.imageWidth, 0, ok1);
+  SphericalCoordinates c2 = xy2rdByExternal(wcsPath, fov.imageWidth, fov.imageHeight, ok2);
+  SphericalCoordinates c3 = xy2rdByExternal(wcsPath, 0, fov.imageHeight, ok3);
+
+
+  // 角点顺序：0(0,0) 1(W,0) 2(W,H) 3(0,H)
+  result.RA_0 = c0.ra; result.DEC_0 = c0.dec;
+  result.RA_1 = c1.ra; result.DEC_1 = c1.dec;
+  result.RA_2 = c2.ra; result.DEC_2 = c2.dec;
+  result.RA_3 = c3.ra; result.DEC_3 = c3.dec;
+
+  Logger::Log("RA DEC Rotation(degree) " + std::to_string(RA_Degree) + " " + std::to_string(DEC_Degree) + " " + std::to_string(Rotation_Degree), LogLevel::INFO, DeviceType::MAIN);
+  Logger::Log("RA DEC " + QString::number(RA_Degree, 'g', 9).toStdString() + " " + QString::number(DEC_Degree, 'g', 9).toStdString(), LogLevel::INFO, DeviceType::MAIN);
+  result.RA_Degree = RA_Degree;
+  result.DEC_Degree = DEC_Degree;
+  PlateSolveInProgress = false;
+  return result;
+}
 SloveResults Tools::onSolveFinished(int exitCode) {
-  qDebug("Solve Finished!!!");
-  qDebug("Solve Finished!!!");
-  qDebug("Solve Finished!!!");
-  isSolveImageFinished = true;
+  Logger::Log("Solve Finished!!! 退出码: " + std::to_string(exitCode), LogLevel::INFO, DeviceType::MAIN);
+  
+  if (exitCode == 0) {
+    isSolveImageFinished = true;
+    PlateSolveInProgress = false;
+    Logger::Log("解析成功完成", LogLevel::INFO, DeviceType::MAIN);
+  } else {
+    Logger::Log("解析失败，退出码: " + std::to_string(exitCode), LogLevel::ERROR, DeviceType::MAIN);
+    isSolveImageFinished = false;
+    PlateSolveInProgress = false;
+  }
 }
 
 WCSParams Tools::extractWCSParams(const QString& wcsInfo) {
@@ -4431,16 +5849,84 @@ WCSParams Tools::extractWCSParams(const QString& wcsInfo) {
     wcs.cd21 = wcsInfo.mid(pos7 + 5, wcsInfo.indexOf("\n", pos7) - pos7 - 5).toDouble();
     wcs.cd22 = wcsInfo.mid(pos8 + 5, wcsInfo.indexOf("\n", pos8) - pos8 - 5).toDouble();
 
-    qDebug() << "crpix0: " << QString::number(wcs.crpix0, 'g', 9);
-    qDebug() << "crpix1: " << QString::number(wcs.crpix1, 'g', 9);
-    qDebug() << "crval0: " << QString::number(wcs.crval0, 'g', 9);
-    qDebug() << "crval1: " << QString::number(wcs.crval1, 'g', 9);
-    qDebug() << "cd11: " << QString::number(wcs.cd11, 'g', 9);
-    qDebug() << "cd12: " << QString::number(wcs.cd12, 'g', 9);
-    qDebug() << "cd21: " << QString::number(wcs.cd21, 'g', 9);
-    qDebug() << "cd22: " << QString::number(wcs.cd22, 'g', 9);
+    // Logger::Log("crpix0: " + QString::number(wcs.crpix0, 'g', 9).toStdString(), LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("crpix1: " + QString::number(wcs.crpix1, 'g', 9).toStdString(), LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("crval0: " + QString::number(wcs.crval0, 'g', 9).toStdString(), LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("crval1: " + QString::number(wcs.crval1, 'g', 9).toStdString(), LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("cd11: " + QString::number(wcs.cd11, 'g', 9).toStdString(), LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("cd12: " + QString::number(wcs.cd12, 'g', 9).toStdString(), LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("cd21: " + QString::number(wcs.cd21, 'g', 9).toStdString(), LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("cd22: " + QString::number(wcs.cd22, 'g', 9).toStdString(), LogLevel::INFO, DeviceType::MAIN);
     
     return wcs;
+}
+
+// 从wcsinfo输出中提取视场信息到FieldOfView结构体
+FieldOfView Tools::extractFieldOfViewFromWcsInfo(const QString& wcsInfo) {
+    FieldOfView fov;
+    
+    // 辅助函数：提取一个参数的值
+    auto extractValue = [&wcsInfo](const QString& key) -> double {
+        int pos = wcsInfo.indexOf(key);
+        if (pos != -1) {
+            int endOfLine = wcsInfo.indexOf("\n", pos);
+            if (endOfLine == -1) endOfLine = wcsInfo.length();
+            
+            // 提取从key后到行尾的内容
+            QString valueStr = wcsInfo.mid(pos + key.length(), endOfLine - pos - key.length()).trimmed();
+            // 取第一个非空白部分作为数值
+            QStringList parts = valueStr.split(" ", Qt::SkipEmptyParts);
+            if (!parts.isEmpty()) {
+                return parts[0].toDouble();
+            }
+        }
+        return 0.0;
+    };
+    
+    // 提取直接给出的视场参数
+    fov.width = extractValue("fieldw");
+    fov.height = extractValue("fieldh");
+    fov.ra_min = extractValue("ramin");
+    fov.ra_max = extractValue("ramax");
+    fov.dec_min = extractValue("decmin");
+    fov.dec_max = extractValue("decmax");
+    fov.area = extractValue("fieldarea");
+    fov.ra_center = extractValue("ra_center");
+    fov.dec_center = extractValue("dec_center");
+    fov.orientation = extractValue("orientation_center");
+    
+    // 计算视场大小（用于验证）
+    double pixelScale = extractValue("pixscale"); // 角秒/像素
+    int imageWidth = extractValue("imagew");
+    int imageHeight = extractValue("imageh");
+    fov.imageWidth = imageWidth;
+    fov.imageHeight = imageHeight;
+    
+    fov.calculatedWidth = (imageWidth * pixelScale) / 3600.0; // 转换为度
+    fov.calculatedHeight = (imageHeight * pixelScale) / 3600.0;
+    
+    // 记录提取的视场信息
+    // Logger::Log("提取的视场信息:", LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("中心位置: RA=" + QString::number(fov.ra_center, 'g', 9).toStdString() + 
+    //           ", Dec=" + QString::number(fov.dec_center, 'g', 9).toStdString(), 
+    //           LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("视场大小: " + QString::number(fov.width, 'g', 6).toStdString() + 
+    //           "° × " + QString::number(fov.height, 'g', 6).toStdString() + "°", 
+    //           LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("计算大小: " + QString::number(fov.calculatedWidth, 'g', 6).toStdString() + 
+    //           "° × " + QString::number(fov.calculatedHeight, 'g', 6).toStdString() + "°", 
+    //           LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("视场范围: RA " + QString::number(fov.ra_min, 'g', 6).toStdString() + 
+    //           "° 到 " + QString::number(fov.ra_max, 'g', 6).toStdString() + 
+    //           "°, Dec " + QString::number(fov.dec_min, 'g', 6).toStdString() + 
+    //           "° 到 " + QString::number(fov.dec_max, 'g', 6).toStdString() + "°", 
+    //           LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("视场面积: " + QString::number(fov.area, 'g', 6).toStdString() + 
+    //           " 平方度", LogLevel::INFO, DeviceType::MAIN);
+    // Logger::Log("方向角: " + QString::number(fov.orientation, 'g', 6).toStdString() + 
+    //           "°", LogLevel::INFO, DeviceType::MAIN);
+    
+    return fov;
 }
 
 // 函数：从像素坐标转换为RaDec
@@ -4454,14 +5940,88 @@ SphericalCoordinates Tools::pixelToRaDec(double x, double y, const WCSParams& wc
     return {ra, dec};
 }
 
+
+SphericalCoordinates Tools::xy2rdByExternal(const QString& wcsFile, double x, double y, bool& ok) {
+    ok = false;
+    QProcess proc;
+    QString cmd = QString("wcs-xy2rd -w %1 -x %2 -y %3").arg(wcsFile).arg(x, 0, 'f', 6).arg(y, 0, 'f', 6);
+    proc.start(cmd);
+    if (!proc.waitForFinished(5000)) {
+        Logger::Log("wcs-xy2rd 执行超时: " + cmd.toStdString(), LogLevel::WARNING, DeviceType::MAIN);
+        return {0.0, 0.0};
+    }
+    QString out = proc.readAllStandardOutput();
+    QString err = proc.readAllStandardError();
+    if (!err.isEmpty()) {
+        Logger::Log("wcs-xy2rd stderr: " + err.toStdString(), LogLevel::WARNING, DeviceType::MAIN);
+    }
+
+    // 1) 优先匹配 "RA,Dec (ra, dec)" 格式
+    {
+        QRegularExpression reRADEC("RA,?\\s*Dec\\s*\\(\\s*([-+]?\\d+(?:\\.\\d+)?)\\s*,\\s*([-+]?\\d+(?:\\.\\d+)?)\\s*\\)",
+                                   QRegularExpression::CaseInsensitiveOption);
+        auto m = reRADEC.match(out);
+        if (m.hasMatch()) {
+            double ra = m.captured(1).toDouble();
+            double dec = m.captured(2).toDouble();
+            ok = true;
+            return {ra, dec};
+        }
+    }
+
+    // 2) 兼容纯两列数字输出（例如："123.45 67.89"），抓取最后两组浮点数
+    {
+        QRegularExpression reFloat("[-+]?\\d+(?:\\.\\d+)?");
+        QRegularExpressionMatchIterator it = reFloat.globalMatch(out);
+        QVector<double> nums;
+        while (it.hasNext()) {
+            auto m = it.next();
+            bool okNum = false;
+            double v = m.captured(0).toDouble(&okNum);
+            if (okNum) nums.push_back(v);
+        }
+        if (nums.size() >= 2) {
+            double ra = nums[nums.size()-2];
+            double dec = nums[nums.size()-1];
+            ok = true;
+            return {ra, dec};
+        }
+    }
+
+    Logger::Log("wcs-xy2rd 输出无法解析: " + out.toStdString(), LogLevel::WARNING, DeviceType::MAIN);
+    return {0.0, 0.0};
+}
+
 // 函数：从WCS参数和图像尺寸计算四个角的RaDec值
 std::vector<SphericalCoordinates> Tools::getFOVCorners(const WCSParams& wcs, int imageWidth, int imageHeight) {
     std::vector<SphericalCoordinates> corners(4);
+    
+    // 增加调试输出
+    Logger::Log("WCS参数: crpix0=" + std::to_string(wcs.crpix0) + 
+                " crpix1=" + std::to_string(wcs.crpix1) +
+                " 变换矩阵: " + std::to_string(wcs.cd11) + "," + 
+                std::to_string(wcs.cd12) + "," + std::to_string(wcs.cd21) + 
+                "," + std::to_string(wcs.cd22), LogLevel::INFO, DeviceType::MAIN);
+    
     corners[0] = pixelToRaDec(0, 0, wcs);                  // Bottom-left
     corners[1] = pixelToRaDec(imageWidth, 0, wcs);         // Bottom-right
     corners[2] = pixelToRaDec(imageWidth, imageHeight, wcs); // Top-right
     corners[3] = pixelToRaDec(0, imageHeight, wcs);        // Top-left
-
+    
+    // 检查计算出的坐标是否相似
+    bool tooSimilar = true;
+    for (int i = 1; i < 4; i++) {
+        if (std::abs(corners[i].ra - corners[0].ra) > 0.0001 ||
+            std::abs(corners[i].dec - corners[0].dec) > 0.0001) {
+            tooSimilar = false;
+            break;
+        }
+    }
+    
+    if (tooSimilar) {
+        Logger::Log("警告：计算的四个角点坐标几乎相同，WCS参数可能有问题", LogLevel::WARNING, DeviceType::MAIN);
+    }
+    
     return corners;
 }
 
@@ -4510,77 +6070,8 @@ double Tools::calculateRSquared(QVector<QPointF> data, float a, float b, float c
         ssTotal += (y - meanY) * (y - meanY);
         ssResidual += (y - yFit) * (y - yFit);
     }
-
     double rSquared = 1 - (ssResidual / ssTotal);
 
     // rSquaredLabel->setText(QString("R²: %1").arg(rSquared));
     return rSquared;
 }
-
-// 2023.12.21 CJQ
-// StelObjectSelect Tools::getStelObjectSelectName() 
-// {
-//   StelObjectSelect Object;
-//   StelObjectMgr* Watch_objectMgr = GETSTELMODULE(StelObjectMgr);
-//   QList<StelObjectP> Watch_Selected = Watch_objectMgr->getSelectedObject();
-//   if (!Watch_Selected.empty()) {
-//     Object.name = Watch_Selected[0]->getEnglishName();
-
-//     double dec_j2000 = 0;
-// 		double ra_j2000 = 0;
-// 		StelUtils::rectToSphe(&ra_j2000,&dec_j2000,Watch_Selected[0]->getJ2000EquatorialPos(StelApp::getInstance().getCore())); 
-
-//     double GOTO_RA = Tools::RadToHour(ra_j2000);
-//     double GOTO_DEC = Tools::RadToDegree(dec_j2000);
-
-//     Object.Ra_Hour = GOTO_RA;
-//     Object.Dec_Degree = GOTO_DEC;
-
-//     return Object;
-//   }
-//   else
-//   {
-//     Object.name = "No Select";
-//     Object.Ra_Hour = 0;
-//     Object.Dec_Degree = 0;
-
-//     return Object;
-//   }
-// }
-
-// 2023.12.21 CJQ
-// StelObjectSelect Tools::getTargetRaDecFromStel(std::string SearchName)
-// {
-//   StelObjectSelect result;
-//   result.name = SearchName.c_str();
-//   StelObjectMgr* Search_objectMgr = GETSTELMODULE(StelObjectMgr);
-// 	StelMovementMgr* Search_mvmgr = GETSTELMODULE(StelMovementMgr);
-
-// 	Search_objectMgr->findAndSelect(SearchName.c_str());
-
-// 	QList<StelObjectP> newSelected = Search_objectMgr->getSelectedObject();
-// 	if (!newSelected.empty())
-// 	{
-// 		// Can't point to home planet
-// 		if (newSelected[0]->getEnglishName()!= StelApp::getInstance().getCore()->getCurrentLocation().planetName)
-// 		{
-//       double dec_j2000 = 0;
-// 		  double ra_j2000 = 0;
-// 		  StelUtils::rectToSphe(&ra_j2000,&dec_j2000,newSelected[0]->getJ2000EquatorialPos(StelApp::getInstance().getCore()));
-// 			Search_mvmgr->moveToObject(newSelected[0], Search_mvmgr->getAutoMoveDuration());
-// 			Search_mvmgr->setFlagTracking(true);
-//       result.Ra_Hour = Tools::RadToHour(ra_j2000);
-//       result.Dec_Degree = Tools::RadToDegree(dec_j2000);
-//       return result;
-// 		}
-// 		else
-//     {
-// 			Search_objectMgr->unSelect();
-//       result.name = "No Target";
-//       result.Ra_Hour = 0;
-//       result.Dec_Degree = 0;
-
-//       return result;
-// 		}	
-// 	}
-// }

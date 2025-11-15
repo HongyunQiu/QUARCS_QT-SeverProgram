@@ -20,6 +20,7 @@
 #include <QApplication>
 #include <QObject>
 #include <QDebug>
+#include "Logger.h"
 
 #include <stellarsolver.h>
 
@@ -85,14 +86,15 @@ struct DriversListNew {
 //used to store the device of the user selected
 
 struct SystemDevice {
-  QString Description{};
+  QString Description{};  // Mount MainCamera Guider Focuser
   int DeviceIndiGroup{};  // number or text.  if number, using the INDI grounp// number standard
   QString DeviceIndiName{};  //"QHY CCD QHY268M-XXXX"
   QString DriverIndiName;    //"indi_qhy_ccd"  or "libqhyccd"
   QString DriverFrom{};      // INDI,ASCOM,NATIVE.
+  int BaudRate{};  // 9600,19200,38400,57600,115200,230400
   INDI::BaseDevice *dp;
-  // void* dp = nullptr;
   bool isConnect = false;
+  bool isBind = false;
 };
 
 struct SystemDeviceList {
@@ -100,6 +102,18 @@ struct SystemDeviceList {
   int currentDeviceCode = -1;
 };
 
+struct DSLRsInfo
+{
+  QString Name;
+  int SizeX;
+  int SizeY;
+  double PixelSize;
+};
+
+struct DSLRsInfoList
+{
+  QVector<DSLRsInfo> DSLRsInfoList;
+};
 
 struct CartesianCoordinates {
     double x;
@@ -117,20 +131,33 @@ struct AltAz {
 };
 
 struct WCSParams {
-    double crpix0;
-    double crpix1;
-    double crval0;
-    double crval1;
-    double cd11;
-    double cd12;
-    double cd21;
-    double cd22;
+  double crpix0, crpix1;  // 参考像素
+  double crval0, crval1;  // 参考天球坐标
+  double cd11, cd12, cd21, cd22;  // 变换矩阵
+};
+
+struct FieldOfView {
+    double width;          // 视场宽度(度)
+    double height;         // 视场高度(度)
+    double calculatedWidth;  // 计算的宽度
+    double calculatedHeight; // 计算的高度
+    double imageWidth;       // 图像宽度
+    double imageHeight;      // 图像高度
+    double ra_min;         // 最小赤经
+    double ra_max;         // 最大赤经
+    double dec_min;        // 最小赤纬
+    double dec_max;        // 最大赤纬
+    double ra_center;      // 中心赤经
+    double dec_center;     // 中心赤纬
+    double orientation;    // 方向角
+    double area;           // 视场面积
 };
 
 struct SloveResults
 {
   double RA_Degree;
   double DEC_Degree;
+
 
   double RA_0;
   double DEC_0;
@@ -173,6 +200,7 @@ struct ScheduleData
   int repeatNumber;       //重复张数
   QString shootType;      //拍摄类型
   bool resetFocusing;     //重新调焦
+  int exposureDelay;      //曝光延迟（毫秒），相邻两张曝光之间额外等待的时间
   int progress;           //进度
 };
 
@@ -212,22 +240,34 @@ struct loadFitsResult
   uint8_t *imageBuffer;
 };
 
-struct MountStatus
-{
-  QString status;
-  QString error;
-};
-
 struct CamBin
 {
   int camxbin;
   int camybin;
 };
 
+// 定义 Bayer 模式的枚举类型
+enum BayerPattern {
+  BAYER_RGGB = 0,  // 红-绿 绿-蓝
+  BAYER_BGGR = 1,  // 蓝-绿 绿-红
+  BAYER_GRBG = 2,  // 绿-红 蓝-绿
+  BAYER_GBRG = 3   // 绿-蓝 红-绿
+};
+
+
 class Tools : public QObject {
   Q_OBJECT
   Q_DISABLE_COPY(Tools)
+ protected:
+  static Tools* instance_;
+
  public:
+  static Tools* getInstance() {
+    return instance_;
+  }
+
+
+
   static void Initialize();
   static void Release();
 
@@ -241,7 +281,7 @@ class Tools : public QObject {
   static void InitSystemDeviceList();
   static void CleanSystemDeviceListConnect();
   static int  GetTotalDeviceFromSystemDeviceList();
-  static bool GetIndexFromSystemDeviceList(const QString& devname, int& index);
+  static bool getIndexFromSystemDeviceListByName(const QString& devname, int& index);
   static void ClearSystemDeviceListItem(int index);
   static SystemDeviceList& systemDeviceList();
 
@@ -249,8 +289,10 @@ class Tools : public QObject {
   static void printDevGroups2(const DriversList driver_list);
   static void startIndiDriver(QString driver_name);
   static void stopIndiDriver(QString driver_name);
-  static void printSystemDeviceList(SystemDeviceList s);
-  static void makeConfigFolder();
+  static void printSystemDeviceList(const SystemDeviceList& s);
+  static QStringList getCameraNumFromSystemDeviceList(const SystemDeviceList& s);
+
+  static void makeConfigFile();
   static void makeImageFolder();
   static void saveSystemDeviceList(SystemDeviceList deviceList);
   static SystemDeviceList readSystemDeviceList();
@@ -258,17 +300,26 @@ class Tools : public QObject {
   static QString readExpTimeList();
   static void saveCFWList(QString Name, QString List);
   static QString readCFWList(QString Name);
+
+  static void saveDSLRsInfo(DSLRsInfo DSLRsInfo);
+  static DSLRsInfo readDSLRsInfo(QString Name);
+
+  static void readClientSettings(const std::string& fileName, std::unordered_map<std::string, std::string>& config);
+  static void saveClientSettings(const std::string& fileName, const std::unordered_map<std::string, std::string>& config);
+
   static void stopIndiDriverAll(const DriversList driver_list);
 
   static uint32_t readFitsHeadForDevName(std::string filename,QString &devname);
 
   static void clearSystemDeviceListItem(SystemDeviceList &s,int index);                          //
   static void initSystemDeviceList(SystemDeviceList &s);                                         //
-  static int getTotalDeviceFromSystemDeviceList(SystemDeviceList s);                             //
+  static int getTotalDeviceFromSystemDeviceList(const SystemDeviceList& s); 
+  static int getDriverNumFromSystemDeviceList(const SystemDeviceList& s);                            //
   static void cleanSystemDeviceListConnect(SystemDeviceList &s);                                 //
-  static uint32_t getIndexFromSystemDeviceList(SystemDeviceList s,QString devname,int &index);   //
-
+  static uint32_t getIndexFromSystemDeviceListByName(const SystemDeviceList& s,QString devname,int &index);   //
   static int readFits(const char* fileName, cv::Mat& image);
+
+  static QString getFitsCaptureTime(const char* fileName);
 
   static int readFits_(const char* fileName, cv::Mat& image);
 
@@ -304,6 +355,7 @@ class Tools : public QObject {
   static void Bit16To8_MakeLUT(uint16_t B, uint16_t W, uint8_t* lut);
   static void Bit16To8_Stretch(cv::Mat img16, cv::Mat img8, uint16_t B,
                                uint16_t W);
+  static cv::Mat convert8UTo16U_BayerSafe(const cv::Mat& mat8u, bool scaleRange = true);
   static void CvDebugShow(cv::Mat img, const std::string& name = "test");
   static void CvDebugSave(cv::Mat img, const std::string& name = "test.png");
 
@@ -315,6 +367,18 @@ class Tools : public QObject {
   static cv::Mat CalMoments(cv::Mat image);
 
   static QList<FITSImage::Star> FindStarsByStellarSolver(bool AllStars, bool runHFR);
+  
+  /**
+   * @brief 从文件路径读取FITS图像并识别星点数量
+   * @param fileName FITS文件路径
+   * @param AllStars 是否返回所有星点（true）或只返回部分星点（false）
+   * @param runHFR 是否计算HFR
+   * @return 识别到的星点数量，如果失败返回-1
+   */
+  static int FindStarsCountFromFile(QString fileName, bool AllStars = true, bool runHFR = false);
+
+  static bool findStarsByPython_Process(QString filename);
+  static double getLastHFR();
 
   static loadFitsResult loadFits(QString fileName);
 
@@ -329,6 +393,8 @@ class Tools : public QObject {
   static cv::Mat processMatWithBinAvg(cv::Mat& image, uint32_t camxbin, uint32_t camybin, bool isColor, bool isAVG);
 
   static uint32_t PixelsDataSoftBin_AVG(uint8_t *srcdata, uint8_t *bindata, uint32_t width, uint32_t height, uint32_t depth, uint32_t camxbin, uint32_t camybin);
+
+  static cv::Mat PixelsDataSoftBin_Bayer(cv::Mat srcMat, uint32_t camxbin, uint32_t camybin, BayerPattern bayerPattern);
 
   static uint32_t PixelsDataSoftBin(uint8_t* srcdata, uint8_t* bindata, uint32_t width, uint32_t height, uint32_t camchannels, uint32_t depth, uint32_t camxbin, uint32_t camybin, bool iscolor);
 
@@ -395,11 +461,18 @@ class Tools : public QObject {
   static MinMaxFOV calculateFOV(int FocalLength,double CameraSize_width,double CameraSize_height);
   static bool WaitForPlateSolveToComplete();
   static bool isSolveImageFinish();
-  static SloveResults PlateSolve(QString filename, int FocalLength,double CameraSize_width,double CameraSize_height, bool USEQHYCCDSDK);
+  static bool isPlateSolveInProgress();
+  static bool PlateSolve(QString filename, int FocalLength,double CameraSize_width,double CameraSize_height, bool USEQHYCCDSDK, int mode = 0, double lastRA = 0.0, double lastDEC = 0.0);
+  // mode: 0=基础模式, 1=包含视场参数, 2=包含视场和位置参数
+  // lastRA: 上次解析的赤经，单位为度 (0-360°)
+  // lastDEC: 上次解析的赤纬，单位为度 (-90° to +90°)
+  // 智能回退: 模式2→1→0, 模式1→0, 根据参数可用性自动选择最优模式
   static SloveResults ReadSolveResult(QString filename, int imageWidth, int imageHeight);
   static WCSParams extractWCSParams(const QString& wcsInfo);
+  static FieldOfView extractFieldOfViewFromWcsInfo(const QString& wcsInfo);
   static SphericalCoordinates pixelToRaDec(double x, double y, const WCSParams& wcs);
   static std::vector<SphericalCoordinates> getFOVCorners(const WCSParams& wcs, int imageWidth, int imageHeight);
+  static SphericalCoordinates xy2rdByExternal(const QString& wcsFile, double x, double y, bool& ok);
 
   static StelObjectSelect getStelObjectSelectName();
 
@@ -409,18 +482,24 @@ class Tools : public QObject {
 
   static double calculateRSquared(QVector<QPointF> data, float a, float b, float c);
 
+  static void saveParameter(const QString& deviceCategory, const QString& functionCategory, const QString& parameterValue);
+  static QMap<QString, QString> readParameters(const QString& deviceCategory);
+  
 public slots:
   void StellarSolverLogOutput(QString text);
 
   SloveResults onSolveFinished(int exitCode);
 
+signals:
+    void parseInfoEmitted(const QString& message);
+
  private:
   Tools();
   ~Tools();
 
-  static Tools* instance_;
-
   QList<FITSImage::Star> FindStarsByStellarSolver_(bool AllStars, const FITSImage::Statistic &imagestats, const uint8_t *imageBuffer, bool runHFR);
+
+
 };
 
 #endif  // TOOLS_HPP
