@@ -56,6 +56,7 @@ install(TARGETS client
 
 target_include_directories(client PUBLIC
   /usr/include/libindi
+  /usr/include/libstellarsolver
   /usr/local/include/libstellarsolver
 )
 
@@ -70,6 +71,7 @@ target_link_libraries(client PUBLIC
 
 target_include_directories(client PUBLIC
     /usr/local/include
+    /usr/include/libstellarsolver
 )
 
 target_link_libraries(client PRIVATE
