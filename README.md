@@ -168,7 +168,7 @@ Installation steps:
       ./installStellarSolverLibraryQt5.sh
 
 after that, if you meet the stellarsolver.h not found. You need to edit the cmakelists.txt in QUARCS_QT-ServerPrograme for the directories
-/user/include/stellarsolver
+/usr/include/stellarsolver
 
 5、Install QT components:
 -
