@@ -174,7 +174,18 @@ public:
      * @param mainWindow 主窗口指针，用于访问拍摄状态
      * @param parent 父对象指针
      */
-    explicit PolarAlignment(MyClient* indiServer, INDI::BaseDevice* dpMount, INDI::BaseDevice* dpMainCamera, QObject *parent = nullptr);
+    /**
+     * @brief 构造函数（兼容“单设备SDK连接”）
+     * @param indiServer INDI服务器客户端
+     * @param dpMount    赤道仪（INDI）
+     * @param dpMainCamera 主相机（INDI，若主相机走 SDK 可为空）
+     * @param useSdkMainCamera 主相机是否走 SDK（单设备维度）
+     */
+    explicit PolarAlignment(MyClient* indiServer,
+                            INDI::BaseDevice* dpMount,
+                            INDI::BaseDevice* dpMainCamera,
+                            bool useSdkMainCamera,
+                            QObject *parent = nullptr);
     
     /**
      * @brief 析构函数
@@ -394,6 +405,16 @@ signals:
      */
     void guidanceAdjustmentStepProgress(GuidanceAdjustmentStep step, QString message, int starCount = -1);
 
+    /**
+     * @brief 请求主线程触发一次拍摄（兼容 SDK / INDI）
+     * @param exposureTimeMs 曝光时间（毫秒）
+     *
+     * 说明：
+     * - INDI 模式下 PolarAlignment 也可以直接调用 indiServer->takeExposure；
+     * - SDK 模式下 dpMainCamera 可能为空，此时通过该信号让 MainWindow 调用统一入口 INDI_Capture()。
+     */
+    void requestCapture(int exposureTimeMs);
+
 private slots:
     /**
      * @brief 状态定时器超时处理
@@ -559,6 +580,12 @@ private:
      * @return 解析模式 (0=基础模式, 1=视场模式, 2=高精度模式)
      */
     int selectOptimalSolveMode();
+    
+    /**
+     * @brief 根据本次解析结果更新解析模式统计信息
+     * @param solveSucceeded 本次解析是否成功
+     */
+    void updateSolveModeStatistics(bool solveSucceeded);
     
     /**
      * @brief 计算球面两点间的角距离
@@ -963,6 +990,7 @@ private:
     MyClient* indiServer;           // INDI服务器客户端
     INDI::BaseDevice* dpMount;      // 望远镜设备指针
     INDI::BaseDevice* dpMainCamera; // 主相机设备指针
+    bool useSdkMainCamera{false};   // 单设备：主相机是否使用 SDK 通路
     
     PolarAlignmentState currentState;    // 当前校准状态
     PolarAlignmentState obstacleFromState; // 避开遮挡前的状态
@@ -1024,6 +1052,10 @@ private:
     bool secondCaptureAvoided;    // 是否进行了第二次拍摄避障
     bool thirdCaptureAvoided;    // 是否进行了第三次拍摄避障
     int captureAttemptCount;     // 遮挡检测时的拍摄尝试次数
+
+    // 解析模式状态
+    int lastSolveMode;                 // 上一次解析使用的模式（0=全局，1=视场，2=视场+RA/DEC）
+    int consecutiveMode2SolveFailures; // 在模式2下连续解析失败次数
 
     // 调整指导数据容器
     QVector<AdjustmentGuideData> adjustmentGuideDataHistory; // 调整指导数据历史记录

@@ -16,19 +16,24 @@
 #include <fitsio.h>
 #include <random> // 添加随机数生成器头文件
 #include "websocketthread.h"
+// SDK：注意本工程的“SDK连接”是按设备分别启用的（非全局模式）
+#include "sdks/SdkCommon.h"
+#include "sdks/SdkManager.h"
 
 // 自动对焦状态枚举
 enum class AutoFocusState {
-    IDLE,                   // 空闲状态
-    CHECKING_STARS,         // 检查星点
-    LARGE_RANGE_SEARCH,     // 大范围找星
-    COARSE_ADJUSTMENT,      // 粗调
-    FINE_ADJUSTMENT,        // 精调
-    COLLECTING_DATA,        // 收集数据
-    FITTING_DATA,           // 拟合数据
-    MOVING_TO_BEST_POSITION, // 移动到最佳位置
-    COMPLETED,              // 完成
-    ERROR                   // 错误状态
+    IDLE,                     // 空闲状态
+    CHECKING_STARS,           // 检查星点
+    LARGE_RANGE_SEARCH,       // 大范围找星
+    COARSE_ADJUSTMENT,        // 粗调
+    FINE_ADJUSTMENT,          // 精调（基于 SNR，用于完整自动对焦流程）
+    SUPER_FINE_ADJUSTMENT,    // 更细致精调（基于 HFR 拟合，用于完整自动对焦流程）
+    FINE_HFR_ADJUSTMENT_NEW,  // 新增：独立 HFR 精调模式（精调按钮触发）
+    COLLECTING_DATA,          // 收集数据
+    FITTING_DATA,             // 拟合数据
+    MOVING_TO_BEST_POSITION,  // 移动到最佳位置
+    COMPLETED,                // 完成
+    ERROR                     // 错误状态
 };
 
 // 对焦数据点结构
@@ -72,10 +77,22 @@ public:
      * @param dpMainCamera 主相机设备对象
      * @param parent 父对象
      */
-    explicit AutoFocus(MyClient *indiServer, 
-                      INDI::BaseDevice *dpFocuser, 
-                      INDI::BaseDevice *dpMainCamera, 
+    /**
+     * @brief 构造函数（兼容“单设备SDK连接”）
+     *
+     * 说明：
+     * - SDK 模式不是全局模式，而是“某个具体设备”可能用 SDK 连接；
+     * - 因此主相机/电调可分别选择 INDI 或 SDK 通路；
+     * - 主相机 SDK：通过信号 requestCapture/requestAbortCapture 交给 MainWindow 的统一入口处理（INDI_Capture/INDI_AbortCapture）；
+     * - 电调 SDK：在 AutoFocus 内部直接通过 SdkManager::callByHandle 执行（MoveAbsolute/GetPosition/Abort...）。
+     */
+    explicit AutoFocus(MyClient *indiServer,
+                      INDI::BaseDevice *dpFocuser,
+                      INDI::BaseDevice *dpMainCamera,
                       WebSocketThread *wsThread,
+                      bool useSdkMainCamera,
+                      bool useSdkFocuser,
+                      SdkDeviceHandle sdkFocuserHandle,
                       QObject *parent = nullptr);
     ~AutoFocus();
 
@@ -95,6 +112,7 @@ public:
     void setInitialLargeRangeStep(double percentage);
     void setMinLargeRangeStep(double percentage);
     void setDefaultExposureTime(int exposureTime);  // 设置默认曝光时间
+    void setCoarseDivisionCount(int divisions);     // 设置粗调分段数（总行程 / 分段数）
     
     // 拍摄状态查询
     bool isCaptureEnd() const { return m_isCaptureEnd; }
@@ -139,6 +157,12 @@ public:
     bool isUsingBacklashCompensation() const;           // 检查是否使用空程补偿
     void setBacklashCompensation(int inward, int outward); // 设置空程补偿值
 
+    // 仅从当前位置启动 super-fine 精调（跳过粗调/精调的完整流程）
+    void startSuperFineFromCurrentPosition();
+
+    // 仅从当前位置启动 HFR 精调（新模式，固定步长 100，采样 11 个 HFR 点）
+    void startFineHFRFromCurrentPosition();
+
     void getAutoFocusStep(); // 获取自动对焦步骤信号 - [AUTO_FOCUS_UI_ENHANCEMENT]
     void getAutoFocusData(); // 获取自动对焦数据信号 - [AUTO_FOCUS_UI_ENHANCEMENT]
 
@@ -161,6 +185,20 @@ signals:
     void focuserPositionChanged(int currentPosition); // 电调位置变化信号**xiugai
     void autoFocusStepChanged(int step, const QString &stepDescription); // 自动对焦步骤变化信号 - [AUTO_FOCUS_UI_ENHANCEMENT]
 
+  // 各阶段拍摄进度：stage = "coarse" / "fine" / "super_fine"，current = 当前第几张，total = 总张数
+  void captureProgressChanged(const QString &stage, int current, int total);
+
+  /**
+   * @brief 请求主线程触发一次拍摄（兼容 SDK / INDI）
+   * @param exposureTimeMs 曝光时间（毫秒）
+   */
+  void requestCapture(int exposureTimeMs);
+
+  /**
+   * @brief 请求主线程取消当前拍摄（兼容 SDK / INDI）
+   */
+  void requestAbortCapture();
+
 
 private slots:
     void onTimerTimeout();
@@ -169,11 +207,18 @@ private slots:
     void forceStopAllWaiting();             // 强制停止所有等待状态
 
 private:
+    // 公共初始化逻辑：设备检查 + 成员状态重置 + 行程范围与当前位置读取
+    bool initializeAutoFocusCommon();
     // 硬件设备对象
     MyClient *m_indiServer;          // INDI客户端对象
     INDI::BaseDevice *m_dpFocuser;   // 电调设备对象
     INDI::BaseDevice *m_dpMainCamera; // 主相机设备对象
     WebSocketThread *m_wsThread;// 网络线程
+
+    // “单设备SDK连接”标记（分别作用于主相机/电调）
+    bool m_useSdkMainCamera{false};
+    bool m_useSdkFocuser{false};
+    SdkDeviceHandle m_sdkFocuserHandle{nullptr};
     // 状态管理
     AutoFocusState m_currentState;
     QTimer *m_timer;
@@ -197,22 +242,39 @@ private:
     QVector<FocusDataPoint> m_fineFocusData; // 仅精调数据
     FitResult m_lastFitResult;              // 最后一次拟合结果
     double m_lastHFR;                     // 最近一次由Python得到的HFR
+    // 粗调/精调阶段基于 SNR 的最佳位置记录
+    double m_coarseBestSNR;               // 粗调阶段最佳 SNR（mean_peak_snr）
+    double m_fineBestSNR;                 // 精调阶段最佳 SNR（mean_peak_snr）
     // 扫描序列
     QVector<int> m_coarseScanPositions;    // 粗调扫描位置序列
     int m_coarseScanIndex;                 // 粗调扫描索引
     QVector<int> m_fineScanPositions;      // 精调扫描位置序列
     int m_fineScanIndex;                   // 精调扫描索引
-    int m_coarseStepSpan;                  // 粗调步进（= (max-min)/10）
+    int m_coarseStepSpan;                  // 粗调步进（= 总行程 / m_coarseDivisionCount）
     int m_fineStepSpan;                    // 精调步进（= 粗调步进/10）
+    int m_coarseDivisionCount;             // 粗调分段数（默认 10）
     int m_coarseBestPosition;              // 粗调期望位置
     double m_coarseBestHFR;
+    int m_fineBestPosition;                // 精调阶段 SNR 最佳位置（super-fine 中心）
+    bool m_coarseHasValidSNR;              // 粗调阶段是否存在至少一个 SNR>0 的位置
     
-// === 精调方向与反转逻辑（新增） ===
-int  m_fineDirection;       // +1: 向大的方向；-1: 向小的方向
-int  m_fineIncreaseCount;   // 连续"HFR变大"的计数
-bool m_fineReversed;        // 是否已经发生过一次改向
-int  m_fineCenter;          // 精调中心（粗调最优位置）
-               // 粗调最小HFR
+    // === 新：独立 HFR 精调模式的方向与采样控制参数 ===
+    int  m_fineDirection;                  // +1: 向大的方向；-1: 向小的方向
+    int  m_fineIncreaseCount;              // 连续“HFR 变大”的计数（前 3 点判定时使用）
+    bool m_fineReversed;                   // 是否已经发生过一次改向
+    int  m_fineCenter;                     // 精调中心（粗调最优位置或当前起始位置）
+    int  m_fineHFRStartPosition;           // 新 HFR 精调起始位置
+    int  m_fineHFRStepSize;                // 新 HFR 精调固定步长（固定为 100）
+    int  m_fineHFRTotalPoints;             // 新 HFR 精调总采样点数（固定为 11）
+    int  m_fineHFRCollectedPoints;         // 已采样点数
+    bool m_fineHFRReverseChecked;          // 是否已对前三个点做过“递增趋势”检查
+    int  m_fineHFRCurrentTargetPosition;   // 当前目标采样位置
+
+    // 更细致精调（super-fine）扫描数据
+    QVector<int> m_superFineScanPositions;   // super-fine 扫描位置序列
+    int m_superFineScanIndex;                // super-fine 扫描索引
+    int m_superFineStepSpan;                 // super-fine 步进
+    QVector<FocusDataPoint> m_superFineFocusData; // 仅 super-fine 数据（用于最终拟合）
 
     int m_currentLargeRangeShots;
     double m_currentLargeRangeStep;
@@ -300,7 +362,9 @@ int  m_fineCenter;          // 精调中心（粗调最优位置）
     bool waitForCaptureComplete(int timeoutMs = 30000); // 等待拍摄完成
     bool detectStarsInImage();                      // 检测图像中的星点
     double calculateHFR();                          // 计算HFR值
-    bool detectHFRByPython(double &hfr);          // 通过Python脚本识星并返回HFR
+    bool detectHFRByPython(double &hfr);            // 通过旧的 Python 脚本识星并返回HFR
+    bool detectMedianHFRByPython(double &hfr);      // 通过 calculatestars.py 计算 median_HFR（super-fine 使用）
+    bool detectSNRByPython(double &snr);            // 通过Python脚本计算 avg_top50_snr（粗调/精调）
     bool loadFocuserRangeFromIni(const QString &iniPath = QString()); // 从ini读取电调范围
 
     
@@ -352,6 +416,13 @@ int  m_fineCenter;          // 精调中心（粗调最优位置）
     void startFineAdjustment();
     void processFineAdjustment();
     
+    // 更细致精调流程
+    void startSuperFineAdjustment();
+    void processSuperFineAdjustment();
+
+    // 新 HFR 精调流程（从当前位置启动，仅 HFR 二次拟合）
+    void processFineHFRNewAdjustment();
+    
     // 数据收集辅助方法
     void performCoarseDataCollection();
     void performFineDataCollection();
@@ -359,6 +430,7 @@ int  m_fineCenter;          // 精调中心（粗调最优位置）
     // 数据收集和处理
     void collectFocusData();
     FitResult fitFocusData();                       // 拟合对焦数据
+    FitResult findBestPositionByInterpolation(const QVector<FocusDataPoint>& data); // 基于给定数据的插值法
     void moveToBestPosition(double position);       // 移动到最佳位置
     
     // 拟合算法辅助方法

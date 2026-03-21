@@ -252,11 +252,16 @@ dist_arcm, bearing
 }
 
 
-PolarAlignment::PolarAlignment(MyClient* indiServer, INDI::BaseDevice* dpMount, INDI::BaseDevice* dpMainCamera, QObject *parent)
+PolarAlignment::PolarAlignment(MyClient* indiServer,
+                               INDI::BaseDevice* dpMount,
+                               INDI::BaseDevice* dpMainCamera,
+                               bool useSdkMainCamera,
+                               QObject *parent)
     : QObject(parent)
     , indiServer(indiServer)
     , dpMount(dpMount)
     , dpMainCamera(dpMainCamera)
+    , useSdkMainCamera(useSdkMainCamera)
     , currentState(PolarAlignmentState::IDLE)
     , obstacleFromState(PolarAlignmentState::IDLE)
     , initialRA(0.0)
@@ -278,6 +283,8 @@ PolarAlignment::PolarAlignment(MyClient* indiServer, INDI::BaseDevice* dpMount, 
     , lastCapturedImage("")
     , captureFailureCount(0)
     , solveFailureCount(0)
+    , lastSolveMode(1)
+    , consecutiveMode2SolveFailures(0)
     , targetRA(0.0)
     , targetDEC(0.0)
     , isTargetPositionCached(false)
@@ -321,11 +328,16 @@ bool PolarAlignment::startPolarAlignment()
         result.errorMessage = "校准流程已在运行中";
         return false;
     }
-    if (!indiServer || !dpMount || !dpMainCamera) {
-        Logger::Log("PolarAlignment: 设备不可用，无法启动校准", LogLevel::ERROR, DeviceType::MAIN);
+    if (!indiServer || !dpMount) {
+        Logger::Log("PolarAlignment: 设备不可用(indiServer/dpMount)，无法启动校准", LogLevel::ERROR, DeviceType::MAIN);
         result.isSuccessful = false;
         result.errorMessage = "设备不可用，无法启动校准";
         return false;
+    }
+    // 单设备：主相机可能走 SDK，此时不应依赖 dpMainCamera
+    if (useSdkMainCamera || !dpMainCamera) {
+        Logger::Log("PolarAlignment: 主相机使用 SDK 通路（或 dpMainCamera 为空），将通过 requestCapture 触发拍摄",
+                    LogLevel::INFO, DeviceType::MAIN);
     }
     
     // 验证地理位置配置
@@ -357,6 +369,8 @@ bool PolarAlignment::startPolarAlignment()
     lastCapturedImage = "";
     captureFailureCount = 0;
     solveFailureCount = 0;
+    lastSolveMode = 1;
+    consecutiveMode2SolveFailures = 0;
     firstCaptureAvoidanceCount = 0;
     secondCaptureAvoidanceCount = 0;
     thirdCaptureAvoidanceCount = 0;
@@ -561,6 +575,19 @@ void PolarAlignment::setState(PolarAlignmentState newState)
     if (currentState == newState) return;
     
     currentState = newState;
+
+    // 终态收敛：一旦进入终态，需要立刻将运行标志清零。
+    // 说明：之前 isRunningFlag 的清零放在 processCurrentState() 的 COMPLETED/FAILED 分支中，
+    // 但 setState() 在进入终态会 stop() 定时器，导致 processCurrentState() 不会再次被调用，
+    // 从而 isRunningFlag 永远不变为 false，外部看到的 isRunning() 状态就不会更新。
+    const bool isTerminalState =
+        (newState == PolarAlignmentState::COMPLETED ||
+         newState == PolarAlignmentState::FAILED ||
+         newState == PolarAlignmentState::USER_INTERVENTION);
+    if (isTerminalState) {
+        isRunningFlag = false;
+        isPausedFlag = false;
+    }
     
     // 根据新状态设置对应的状态消息
     switch (newState) {
@@ -752,6 +779,9 @@ void PolarAlignment::setState(PolarAlignmentState newState)
     if (newProgress != progressPercentage) {
         progressPercentage = newProgress;
         // emit progressUpdated(progressPercentage);
+        emit stateChanged(currentState, currentStatusMessage, progressPercentage);
+    } else if (isTerminalState) {
+        // 终态即便进度未变化，也要确保对外发出一次状态更新（尤其是 isRunningFlag 已经变为 false）
         emit stateChanged(currentState, currentStatusMessage, progressPercentage);
     }
     
@@ -1256,10 +1286,7 @@ bool PolarAlignment::moveDecAxisForObstacleAvoidance()
 bool PolarAlignment::captureAndAnalyze(int attempt)
 {
     Logger::Log("PolarAlignment: 拍摄和分析，尝试次数 " + std::to_string(attempt), LogLevel::INFO, DeviceType::MAIN);
-    if (!dpMainCamera) {
-        Logger::Log("PolarAlignment: 相机设备不可用", LogLevel::ERROR, DeviceType::MAIN);
-        return false;
-    }
+    // dpMainCamera 在 SDK 模式下可能为空：拍摄会通过 requestCapture -> MainWindow::INDI_Capture() 完成
     
     // 根据尝试次数确定曝光时间
     int exposureTime;
@@ -1319,12 +1346,14 @@ bool PolarAlignment::captureAndAnalyze(int attempt)
     // 解析图像
     if (!solveImage(lastCapturedImage)) {
         Logger::Log("PolarAlignment: 图像解析开始命令执行失败", LogLevel::WARNING, DeviceType::MAIN);
+        // solveImage 内部已经调用 updateSolveModeStatistics(false)
         return false; // 直接返回失败，不进行重试
     }
     
     // 等待解析完成
     if (!waitForSolveComplete()) {
         Logger::Log("PolarAlignment: 解析超时", LogLevel::WARNING, DeviceType::MAIN);
+        updateSolveModeStatistics(false);
         return false; // 直接返回失败，不进行重试
     }
     
@@ -1367,9 +1396,11 @@ bool PolarAlignment::captureAndAnalyze(int attempt)
         }
         currentRAPosition = analysisResult.RA_Degree;
         currentDECPosition = analysisResult.DEC_Degree;
+        updateSolveModeStatistics(true);
         return true;
     } else {
         Logger::Log("PolarAlignment: 解析结果无效", LogLevel::WARNING, DeviceType::MAIN);
+        updateSolveModeStatistics(false);
         return false; // 直接返回失败，不进行重试
     }
 }
@@ -1645,7 +1676,8 @@ bool PolarAlignment::performGuidanceAdjustmentStep()
     if (!captureImage(exposureTime)) {
         Logger::Log("PolarAlignment: 图像拍摄失败", LogLevel::WARNING, DeviceType::MAIN);
         emit guidanceAdjustmentStepProgress(GuidanceAdjustmentStep::CAPTURING, "拍摄失败", -1);
-        if (isRunningFlag && !isPausedFlag) stateTimer.start(2000);
+        if (isRunningFlag && !isPausedFlag) stateTimer.start(100);
+        if (isRunningFlag && !isPausedFlag) stateTimer.start(100);
         return false;
     }
     
@@ -1653,38 +1685,15 @@ bool PolarAlignment::performGuidanceAdjustmentStep()
     if (!waitForCaptureComplete()) {
         Logger::Log("PolarAlignment: 拍摄超时", LogLevel::WARNING, DeviceType::MAIN);
         emit guidanceAdjustmentStepProgress(GuidanceAdjustmentStep::CAPTURING, "拍摄超时", -1);
-        if (isRunningFlag && !isPausedFlag) stateTimer.start(2000);
+        if (isRunningFlag && !isPausedFlag) stateTimer.start(100);
+        if (isRunningFlag && !isPausedFlag) stateTimer.start(100);
         return false;
     }
     
-    // 2. 拍摄完成后，先做星点识别检查
+    // 2. 拍摄完成后，先做星点质量（SNR）检查
     emit guidanceAdjustmentStepProgress(GuidanceAdjustmentStep::CHECKING_STARS, "正在检查星点质量...");
     
-    int starCount = Tools::FindStarsCountFromFile(lastCapturedImage, true, false);
-    
-    if (starCount < 0) {
-        Logger::Log("PolarAlignment: 星点识别失败，跳过本次调整", LogLevel::WARNING, DeviceType::MAIN);
-        emit guidanceAdjustmentStepProgress(GuidanceAdjustmentStep::CHECKING_STARS, "星点识别失败", -1);
-        if (isRunningFlag && !isPausedFlag) stateTimer.start(2000);
-        return false;
-    }
-    
-    // 如果识别的星点数小于10，认为图像质量差，跳过解析阶段，直接进入下一次拍摄
-    if (starCount < 10) {
-        Logger::Log("PolarAlignment: 星点数量不足（" + std::to_string(starCount) + " < 10），图像质量差，跳过解析，直接进入下一次拍摄", 
-                    LogLevel::WARNING, DeviceType::MAIN);
-        emit guidanceAdjustmentStepProgress(GuidanceAdjustmentStep::CHECKING_STARS, 
-                                           QString("星点数量不足（%1 < 10），图像质量差，跳过解析").arg(starCount), 
-                                           starCount);
-        if (isRunningFlag && !isPausedFlag) stateTimer.start(2000);
-        return false;
-    }
-    
-    // 星点数量足够，记录日志
-    Logger::Log("PolarAlignment: 识别到 " + std::to_string(starCount) + " 颗星点，图像质量良好", LogLevel::INFO, DeviceType::MAIN);
-    emit guidanceAdjustmentStepProgress(GuidanceAdjustmentStep::CHECKING_STARS, 
-                                       QString("识别到 %1 颗星点，图像质量良好").arg(starCount), 
-                                       starCount);
+  
     
     // 3. 星点数量足够，继续解析图像
     emit guidanceAdjustmentStepProgress(GuidanceAdjustmentStep::SOLVING, "正在解析图像...");
@@ -1692,7 +1701,8 @@ bool PolarAlignment::performGuidanceAdjustmentStep()
     if (!solveImage(lastCapturedImage)) {
         Logger::Log("PolarAlignment: 图像解析开始命令执行失败", LogLevel::WARNING, DeviceType::MAIN);
         emit guidanceAdjustmentStepProgress(GuidanceAdjustmentStep::SOLVING, "解析失败", -1);
-        if (isRunningFlag && !isPausedFlag) stateTimer.start(2000);
+        if (isRunningFlag && !isPausedFlag) stateTimer.start(100);
+        if (isRunningFlag && !isPausedFlag) stateTimer.start(100);
         return false;
     }
     
@@ -1700,7 +1710,9 @@ bool PolarAlignment::performGuidanceAdjustmentStep()
     if (!waitForSolveComplete()) {
         Logger::Log("PolarAlignment: 解析超时", LogLevel::WARNING, DeviceType::MAIN);
         emit guidanceAdjustmentStepProgress(GuidanceAdjustmentStep::SOLVING, "解析超时", -1);
-        if (isRunningFlag && !isPausedFlag) stateTimer.start(2000);
+        if (isRunningFlag && !isPausedFlag) stateTimer.start(100);
+        if (isRunningFlag && !isPausedFlag) stateTimer.start(100);
+        updateSolveModeStatistics(false);
         return false;
     }
     
@@ -1711,7 +1723,9 @@ bool PolarAlignment::performGuidanceAdjustmentStep()
     if (!isAnalysisSuccessful(analysisResult)) {
         Logger::Log("PolarAlignment: 解析结果无效", LogLevel::WARNING, DeviceType::MAIN);
         emit guidanceAdjustmentStepProgress(GuidanceAdjustmentStep::CALCULATING, "解析结果无效", -1);
-        if (isRunningFlag && !isPausedFlag) stateTimer.start(2000);
+        updateSolveModeStatistics(false);
+        if (isRunningFlag && !isPausedFlag) stateTimer.start(100);
+        if (isRunningFlag && !isPausedFlag) stateTimer.start(100);
         return false;
     }
     
@@ -1719,6 +1733,7 @@ bool PolarAlignment::performGuidanceAdjustmentStep()
     currentSolveResult = analysisResult;
     currentRAPosition = analysisResult.RA_Degree;
     currentDECPosition = analysisResult.DEC_Degree;
+    updateSolveModeStatistics(true);
 
     if (!isTargetPositionCached) {
         Logger::Log("PolarAlignment: 目标未锁定，请先完成三点校准", LogLevel::ERROR, DeviceType::MAIN);
@@ -1738,28 +1753,84 @@ bool PolarAlignment::performGuidanceAdjustmentStep()
                 std::to_string(targetRA) + ", " + std::to_string(targetDEC) + ")",
                 LogLevel::INFO, DeviceType::MAIN);
 
-    // —— 用固定目标计算东/北分量与球面距离（不再用 RA/DEC 线性差）——
+    // —— 用固定目标计算天球 EN 分量与球面距离（不再用 RA/DEC 线性差）——
     SingleShotGuide guide = delta_to_fixed_target(currentRA, currentDEC, targetRA, targetDEC);
 
-    // 这些"像 az/alt 偏差"的输出仅为兼容旧接口（单位：度），实义是 EN 分量
+    // 这些"像 az/alt 偏差"的输出仅为兼容旧接口（单位：度），实义是天球 EN 分量
     double east_deg  = guide.east_arcmin  / 60.0;
     double north_deg = guide.north_arcmin / 60.0;
     double total_deg = guide.distance_arcmin / 60.0;
 
     Logger::Log(
-        "PolarAlignment: 偏差 - 东 " + std::to_string(guide.east_arcmin) + "′, 北 " +
+        "PolarAlignment: 偏差(天球系) - 东 " + std::to_string(guide.east_arcmin) + "′, 北 " +
         std::to_string(guide.north_arcmin) + "′, 距离 " + std::to_string(guide.distance_arcmin) +
         "′, 方位(自北顺时针) " + std::to_string(guide.bearing_deg_from_north) + "°",
         LogLevel::INFO, DeviceType::MAIN
     );
 
-    // 生成指导文案（建议改为基于 EN 分量）
+    // === 新增：将天球 EN 偏差转换为当前地平系下的方位角/高度角偏差 ===
+    // 思路：
+    // 1) 把当前点/目标点从赤道坐标转为地平坐标 (Az,Alt)；
+    // 2) 在地平坐标对应的单位向量上建立 EN 基底；
+    // 3) 用同一个 log_map_2d 算出在地平切平面上的 EN 分量，即真正的方位/高度偏差。
+    double azimuthOffset_deg  = east_deg;    // 默认先用旧值，作为失败时的回退
+    double altitudeOffset_deg = north_deg;
+
+    double observerLat = 0.0, observerLon = 0.0, observerElev = 0.0;
+    if (getObserverLocation(observerLat, observerLon, observerElev)) {
+        // 1) 计算当前点/目标点的地平坐标
+        double curAz = 0.0, curAlt = 0.0;
+        double tgtAz = 0.0, tgtAlt = 0.0;
+
+        double curRA_hours = currentRA / 15.0;
+        double tgtRA_hours = targetRA  / 15.0;
+
+        if (convertRADECToHorizontal(curRA_hours, currentDEC, observerLat, observerLon, curAz, curAlt) &&
+            convertRADECToHorizontal(tgtRA_hours,  targetDEC,  observerLat, observerLon, tgtAz, tgtAlt)) {
+
+            auto horizToVec = [](double az_deg, double alt_deg) {
+                double az  = az_deg  * kDeg2Rad;
+                double alt = alt_deg * kDeg2Rad;
+                double x = std::sin(az) * std::cos(alt); // East
+                double y = std::cos(az) * std::cos(alt); // North
+                double z = std::sin(alt);                // Up
+                return Vec3{x, y, z};
+            };
+
+            Vec3 S_h = horizToVec(curAz, curAlt);
+            Vec3 T_h = horizToVec(tgtAz, tgtAlt);
+
+            // 2) 在地平系下，以当前指向 S_h 为切点建立 EN 基底
+            Vec3 Up_h = {0, 0, 1};
+            Vec3 north_h = normalize(cross(cross(S_h, Up_h), S_h)); // 朝更高高度（北）方向
+            Vec3 east_h  = normalize(cross(north_h, S_h));
+            TangentBasis B_h { east_h, north_h };                   // e1=东, e2=北
+
+            // 3) 计算地平切平面上的 EN 分量
+            auto [u_east_h, v_north_h] = log_map_2d(S_h, B_h, T_h);
+
+            azimuthOffset_deg  = u_east_h * kRad2Deg;   // + 向东 / - 向西
+            altitudeOffset_deg = v_north_h * kRad2Deg;  // + 向上 / - 向下
+
+            Logger::Log(
+                "PolarAlignment: 偏差(地平系) - 方位 " + std::to_string(azimuthOffset_deg) +
+                "°, 高度 " + std::to_string(altitudeOffset_deg) + "°",
+                LogLevel::INFO, DeviceType::MAIN
+            );
+        } else {
+            Logger::Log("PolarAlignment: EN -> 地平偏差转换失败，使用天球 EN 偏差作为回退", LogLevel::WARNING, DeviceType::MAIN);
+        }
+    } else {
+        Logger::Log("PolarAlignment: 获取观测者位置失败，使用天球 EN 偏差作为回退", LogLevel::WARNING, DeviceType::MAIN);
+    }
+
+    // 生成指导文案（内部使用 result.* 的极轴偏差，得到机械方位/高度调整提示）
     QString adjustmentRa, adjustmentDec;
     QString adjustmentGuide = generateAdjustmentGuide(adjustmentRa, adjustmentDec);
     Logger::Log("PolarAlignment: 调整指导: " + adjustmentGuide.toStdString(),
                 LogLevel::INFO, DeviceType::MAIN);
 
-    // 发信号给 UI：把 EN 分量通过原参数传出（或新增字段更清晰）
+    // 发信号给 UI：通过 offsetRa/offsetDec 输出当前需要调整的方位/高度偏差（度）
     saveAndEmitAdjustmentGuideData(
         currentRAPosition, currentDECPosition,
         currentSolveResult.RA_0, currentSolveResult.DEC_0,
@@ -1767,7 +1838,7 @@ bool PolarAlignment::performGuidanceAdjustmentStep()
         currentSolveResult.RA_2, currentSolveResult.DEC_2,
         currentSolveResult.RA_3, currentSolveResult.DEC_3,
         targetRA, targetDEC,         // 固定目标
-        east_deg, north_deg,         // 兼容旧"az/alt"槽位
+        azimuthOffset_deg, altitudeOffset_deg, // 当前需要调整的方位/高度偏差（度）
         adjustmentRa, adjustmentDec,
         cachedFakePolarRA, cachedFakePolarDEC,
         realPolarRA, realPolarDEC
@@ -1776,21 +1847,7 @@ bool PolarAlignment::performGuidanceAdjustmentStep()
     // 6. 发送完成信号，等待用户调整
     emit guidanceAdjustmentStepProgress(GuidanceAdjustmentStep::WAITING_USER, "等待用户调整...", -1);
 
-    // // 达标判断用球面距离
-    // double precisionThreshold = config.finalVerificationThreshold; // 仍然"度"
-    // if (total_deg < precisionThreshold) {
-    //     Logger::Log("PolarAlignment: 精度达标: " + std::to_string(total_deg) + "° < " +
-    //                 std::to_string(precisionThreshold) + "°", LogLevel::INFO, DeviceType::MAIN);
-    //     result.raDeviation  = east_deg;
-    //     result.decDeviation = north_deg;
-    //     result.totalDeviation = total_deg;
-    //     adjustmentAttempts = 0;
-    //     setState(PolarAlignmentState::FINAL_VERIFICATION);
-    // } else {
-    //     Logger::Log("PolarAlignment: 精度未达标，继续调整",
-    //                 LogLevel::WARNING, DeviceType::MAIN);
-    //     if (isRunningFlag && !isPausedFlag) stateTimer.start(3000);
-    // }
+
     if (isRunningFlag && !isPausedFlag) stateTimer.start(100);
     return true;
 }
@@ -1798,36 +1855,39 @@ bool PolarAlignment::performGuidanceAdjustmentStep()
 bool PolarAlignment::captureImage(int exposureTime)
 {
     Logger::Log("PolarAlignment: 拍摄图像，曝光时间 " + std::to_string(exposureTime) + "ms", LogLevel::INFO, DeviceType::MAIN);
-    if (!dpMainCamera) {
-        Logger::Log("PolarAlignment: 相机设备不可用", LogLevel::ERROR, DeviceType::MAIN);
-        return false;
-    }
-    
     // 检查INDI客户端是否有效
     if (!indiServer) {
         Logger::Log("PolarAlignment: INDI客户端不可用", LogLevel::ERROR, DeviceType::MAIN);
         return false;
     }
     
-    uint32_t ret = indiServer->resetCCDFrameInfo(dpMainCamera);
-    if (ret != QHYCCD_SUCCESS)
-    {
-        Logger::Log("INDI_Capture | indi resetCCDFrameInfo | failed", LogLevel::WARNING, DeviceType::CAMERA);
-    }
-    
-    // 通过INDI接口拍摄图像
-    Logger::Log("PolarAlignment: 开始调用INDI拍摄接口", LogLevel::INFO, DeviceType::MAIN);
-    ret = indiServer->takeExposure(dpMainCamera, exposureTime / 1000.0);
-    if (ret == QHYCCD_SUCCESS) {
-        isCaptureEnd = false;
-        lastCapturedImage = "/dev/shm/ccd_simulator.fits";
+    // 每次触发拍摄前，复位完成标志（由 MainWindow 在 ExposureCompleted 时置为 true）
+    isCaptureEnd = false;
+    lastCapturedImage = "/dev/shm/ccd_simulator.fits";
 
-        Logger::Log("PolarAlignment: 拍摄命令发送成功，等待回调", LogLevel::INFO, DeviceType::MAIN);
-        return true;
-    } else {
-        Logger::Log("PolarAlignment: 拍摄失败，错误代码: " + std::to_string(ret), LogLevel::ERROR, DeviceType::MAIN);
-        return false;
+    // INDI 模式：直接通过 INDI 下发曝光
+    if (!useSdkMainCamera && dpMainCamera) {
+        uint32_t ret = indiServer->resetCCDFrameInfo(dpMainCamera);
+        if (ret != QHYCCD_SUCCESS)
+        {
+            Logger::Log("PolarAlignment::captureImage | indi resetCCDFrameInfo | failed", LogLevel::WARNING, DeviceType::CAMERA);
+        }
+        
+        Logger::Log("PolarAlignment: 开始调用 INDI takeExposure", LogLevel::INFO, DeviceType::MAIN);
+        ret = indiServer->takeExposure(dpMainCamera, exposureTime / 1000.0);
+        if (ret == QHYCCD_SUCCESS) {
+            Logger::Log("PolarAlignment: INDI 拍摄命令发送成功，等待回调", LogLevel::INFO, DeviceType::MAIN);
+            return true;
+        } else {
+            Logger::Log("PolarAlignment: INDI 拍摄失败，错误代码: " + std::to_string(ret), LogLevel::ERROR, DeviceType::MAIN);
+            return false;
+        }
     }
+
+    // SDK 模式：由 MainWindow 统一入口 INDI_Capture() 执行（内部已兼容 SDK/INDI）
+    Logger::Log("PolarAlignment: 触发 requestCapture(统一拍摄入口) 进行拍摄", LogLevel::INFO, DeviceType::MAIN);
+    emit requestCapture(exposureTime);
+    return true;
 }
 
 
@@ -1835,56 +1895,54 @@ bool PolarAlignment::captureImage(int exposureTime)
 int PolarAlignment::selectOptimalSolveMode()
 {
     // 模式说明：0=全局解析；1=加视场；2=加视场+RA/DEC窗口
-    // 输入指标：
-    //   - devAbs = sqrt(raDeviation^2 + decDeviation^2)（切平面偏差幅值，度）
-    //   - distanceFromHistory = 最近一次解析点与当前位置的球面角距（度）
-    // 目标：
-    //   - 偏差大时优先 0；中等时 1；接近时 2；带轻微滞回避免频繁切换
+    // 新策略：
+    //  - 默认优先使用模式1（视场）
+    //  - RA/DEC 窗口（模式2）只在 GUIDING_ADJUSTMENT（指导调整阶段）中启用
+    //  - 当已有有效的三点校准结果，且 RA / DEC 偏差都在 2° 以内时，指导调整阶段尝试使用模式2
+    //  - 如果在当前 RA / DEC 条件下，模式2 连续两次解析失败，则强制退回模式1，
+    //    直到下一次解析成功后再重新根据偏差判断是否可以再次启用模式2
 
-    bool hasValidHistory = isAnalysisSuccessful(currentSolveResult);
-    if (!hasValidHistory) {
-        Logger::Log("PolarAlignment: 无历史解析数据，选择模式1（视场）", LogLevel::INFO, DeviceType::MAIN);
-        return 1;
+    int mode = 1; // 默认：视场模式
+
+    // 非指导调整阶段：禁止使用模式2，只用视场模式
+    if (currentState != PolarAlignmentState::GUIDING_ADJUSTMENT)
+    {
+        Logger::Log("PolarAlignment: 非指导调整阶段，强制使用模式1（视场）", LogLevel::INFO, DeviceType::MAIN);
+        lastSolveMode = mode;
+        return mode;
     }
 
-    // 计算 devAbs（若无有效 result 则置大）
-    double devAbs = (result.isSuccessful && !std::isnan(result.raDeviation) && !std::isnan(result.decDeviation))
-                    ? std::hypot(result.raDeviation, result.decDeviation) : 1e9;
+    bool hasValidHistory = isAnalysisSuccessful(currentSolveResult);
+    if (!hasValidHistory)
+    {
+        Logger::Log("PolarAlignment: 无历史解析数据，使用模式1（视场）", LogLevel::INFO, DeviceType::MAIN);
+        lastSolveMode = mode;
+        return mode;
+    }
 
-    // 计算与历史的角距
-    double currentRA, currentDEC;
-    indiServer->getTelescopeRADECJNOW(dpMount, currentRA, currentDEC);
-    currentRA = Tools::HourToDegree(currentRA);
-    double distanceFromHistory = calculateSphericalDistance(currentRA, currentDEC,
-                                                            currentSolveResult.RA_Degree, currentSolveResult.DEC_Degree);
+    bool hasValidDeviation = result.isSuccessful &&
+                             !std::isnan(result.raDeviation) &&
+                             !std::isnan(result.decDeviation);
 
-    // 阈值（可通过 config 调整）
-    double th2 = std::min(config.solveMode2MaxOffsetDeg, 5.0);   // 模式2窗口硬上限 5°
-    double th1 = std::max(config.solveMode1MaxOffsetDeg, th2 + 1.0); // 模式1阈值 ≥ 模式2阈值
-
-    // 基于两个指标的决策：任一指标大则降级
-    // - 若 devAbs 很小且 distance 小 → 模式2
-    // - 若二者处于中间 → 模式1
-    // - 若 devAbs 或 distance 很大 → 模式0
-    int chosen = 0;
-    if (distanceFromHistory <= th2 && devAbs <= config.largeDeviationThresholdDeg) {
-        chosen = 2;
-    } else if (distanceFromHistory <= th1 && devAbs <= (config.largeDeviationThresholdDeg * 2.0)) {
-        chosen = 1;
-    } else {
-        chosen = 0;
+    // 偏差小于 2°（分别在 RA / DEC 方向上都小于 2°），并且模式2最近没有连续失败两次
+    if (hasValidDeviation &&
+        std::fabs(result.raDeviation) < 2.0 &&
+        std::fabs(result.decDeviation) < 2.0 &&
+        consecutiveMode2SolveFailures < 2)
+    {
+        mode = 2;
     }
 
     Logger::Log(
-        "PolarAlignment: 解析模式选择 - devAbs=" + std::to_string(devAbs) +
-        "°, distHist=" + std::to_string(distanceFromHistory) +
-        "°, th2=" + std::to_string(th2) +
-        "°, th1=" + std::to_string(th1) +
-        ", chosen=" + std::to_string(chosen),
+        "PolarAlignment: 解析模式选择 - mode=" + std::to_string(mode) +
+        ", raDev=" + std::to_string(result.raDeviation) +
+        "°, decDev=" + std::to_string(result.decDeviation) +
+        "°, consecutiveMode2Failures=" + std::to_string(consecutiveMode2SolveFailures),
         LogLevel::INFO, DeviceType::MAIN
     );
 
-    return chosen;
+    lastSolveMode = mode;
+    return mode;
 }
 
 double PolarAlignment::calculateSphericalDistance(double ra1, double dec1, double ra2, double dec2)
@@ -1906,6 +1964,29 @@ double PolarAlignment::calculateSphericalDistance(double ra1, double dec1, doubl
     double distance_deg = distance_rad * 180.0 / M_PI;
     
     return distance_deg;
+}
+
+void PolarAlignment::updateSolveModeStatistics(bool solveSucceeded)
+{
+    // 任意模式下一旦有一次解析成功，就允许再次尝试模式2
+    if (solveSucceeded)
+    {
+        if (consecutiveMode2SolveFailures != 0)
+        {
+            Logger::Log("PolarAlignment: 解析成功，重置模式2连续失败计数", LogLevel::INFO, DeviceType::MAIN);
+        }
+        consecutiveMode2SolveFailures = 0;
+        return;
+    }
+
+    // 仅当上一轮使用的是模式2时，才统计连续失败次数
+    if (lastSolveMode == 2)
+    {
+        consecutiveMode2SolveFailures++;
+        Logger::Log("PolarAlignment: 模式2解析失败，当前连续失败次数 = " +
+                    std::to_string(consecutiveMode2SolveFailures),
+                    LogLevel::WARNING, DeviceType::MAIN);
+    }
 }
 
 bool PolarAlignment::solveImage(const QString& imageFile)
@@ -1932,6 +2013,7 @@ bool PolarAlignment::solveImage(const QString& imageFile)
     if(!ret)
     {
         Logger::Log("PolarAlignment: 图像解析命令执行失败", LogLevel::WARNING, DeviceType::MAIN);
+        updateSolveModeStatistics(false);
         return false;
     }
     
@@ -2102,7 +2184,16 @@ bool PolarAlignment::waitForCaptureComplete()
             if (status != 0)
             {
                 Logger::Log("Failed to read FITS file: " + lastCapturedImage.toStdString(), LogLevel::ERROR, DeviceType::MAIN);
-                return status;
+                isCaptureEnd = false;
+                loop.quit();
+                return;
+            }
+            if (image.empty())
+            {
+                Logger::Log("PolarAlignment: readFits succeeded but image is empty: " + lastCapturedImage.toStdString(), LogLevel::ERROR, DeviceType::MAIN);
+                isCaptureEnd = false;
+                loop.quit();
+                return;
             }
             if (image.type() == CV_8UC1 || image.type() == CV_8UC3 || image.type() == CV_16UC1)
             {
@@ -2112,13 +2203,32 @@ bool PolarAlignment::waitForCaptureComplete()
             else
             {
                 Logger::Log("The current image data type is not supported for processing.", LogLevel::WARNING, DeviceType::MAIN);
-                return -1;
+                isCaptureEnd = false;
+                loop.quit();
+                return;
+            }
+            if (originalImage16.empty())
+            {
+                Logger::Log("PolarAlignment: convert8UTo16U_BayerSafe returned empty image; skip medianBlur", LogLevel::ERROR, DeviceType::MAIN);
+                isCaptureEnd = false;
+                loop.quit();
+                return;
             }
             int binning = 1;
             int currentSize = originalImage16.cols;
 
             Logger::Log("Starting median blur...", LogLevel::INFO, DeviceType::CAMERA);
-            cv::medianBlur(originalImage16, originalImage16, 3);
+            try
+            {
+                cv::medianBlur(originalImage16, originalImage16, 3);
+            }
+            catch (const cv::Exception &e)
+            {
+                Logger::Log(std::string("PolarAlignment: medianBlur failed: ") + e.what(), LogLevel::ERROR, DeviceType::MAIN);
+                isCaptureEnd = false;
+                loop.quit();
+                return;
+            }
             Logger::Log("Median blur applied successfully.", LogLevel::INFO, DeviceType::CAMERA);
 
             // 逐步增加binning直到像素大小小于等于548
